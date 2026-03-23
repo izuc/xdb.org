@@ -85,20 +85,30 @@ impl TableReader {
         })
     }
 
+    /// Check whether the bloom filter indicates the user key might exist.
+    ///
+    /// Returns `true` if the key might be in this file (or no bloom filter
+    /// exists). Returns `false` if the key is definitely absent.
+    pub fn bloom_may_contain(&self, user_key: &[u8]) -> bool {
+        match self.filter_data {
+            Some(ref fd) => BloomFilter::may_contain(fd, user_key),
+            None => true, // no filter → might contain anything
+        }
+    }
+
     /// Point lookup: find the value for a key.
     ///
     /// The key is compared as raw bytes against the keys stored in the table.
-    /// The bloom filter is checked with the full key as provided, since the
-    /// filter was built from the exact keys passed to [`TableBuilder::add`].
+    /// The bloom filter is checked with the user-key portion of the key.
     ///
     /// Returns `Ok(Some((key, value)))` if an exact match is found, or
     /// `Ok(None)` if the key is not present.
     pub fn get(&self, key: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         // Check bloom filter first for a fast negative.
-        // The filter was built from the full keys added to the table, so
-        // we must check with the same full key here.
+        // The filter is built from user keys, so extract the user key portion.
+        let user_key = crate::types::extract_user_key(key);
         if let Some(ref fd) = self.filter_data {
-            if !BloomFilter::may_contain(fd, key) {
+            if !BloomFilter::may_contain(fd, user_key) {
                 return Ok(None);
             }
         }

@@ -80,8 +80,11 @@ impl TableBuilder {
             self.index_block.add(&self.last_key, &handle_encoding);
         }
 
-        // Collect the key for the bloom filter.
-        self.filter_keys.push(key.to_vec());
+        // Collect the USER key for the bloom filter (not the full internal key,
+        // so lookups can check the filter with just the user key regardless of
+        // which sequence number the lookup uses).
+        let ukey = crate::types::extract_user_key(key);
+        self.filter_keys.push(ukey.to_vec());
 
         // Add to the current data block.
         self.data_block.add(key, value);

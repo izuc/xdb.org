@@ -648,10 +648,17 @@ impl Db {
             file_meta.file_size,
         )?;
 
-        // Use the streaming iterator for the search.
-        let ikey = InternalKey::new(user_key, sequence, ValueType::Value);
+        // Fast reject via bloom filter.
+        if !reader.bloom_may_contain(user_key) {
+            Statistics::record(&self.stats.bloom_useful, 1);
+            return Ok(SearchResult::NotFound);
+        }
+
+        // Seek with the raw user_key (not an InternalKey) so bytewise
+        // comparison in the block iterator always lands at or before the
+        // first entry for this user key, regardless of sequence ordering.
         let mut table_iter = reader.iter();
-        table_iter.seek(ikey.as_bytes());
+        table_iter.seek(user_key);
 
         while table_iter.valid() {
             let found_key = table_iter.key();
