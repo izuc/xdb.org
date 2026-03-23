@@ -819,8 +819,6 @@ xdb covers the core 90% of functionality that most applications need, in
 ---
 
 **Phase 4 — Ecosystem:**
-- C FFI (`xdb-ffi/` crate with `include/xdb.h` header — builds cdylib + staticlib)
-- Python bindings (`xdb-python/` crate via PyO3/maturin — `import xdb`)
 - Fuzz targets (WAL reader, SST reader, VersionEdit decoder, WriteBatch parser)
 - Example programs (basic CRUD, iterators, batch + snapshot)
 - README.md with quick start, architecture, and build instructions

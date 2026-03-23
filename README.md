@@ -80,12 +80,6 @@ cargo add xdb
 With optional compression: `cargo add xdb --features lz4`, `--features zstd`,
 or `--features compression` (both).
 
-## Language Bindings
-
-The `xdb-ffi` crate provides C FFI bindings, producing both a static library
-and a shared library (`cdylib`). A C header is available at
-`xdb-ffi/include/xdb.h`. Python bindings via PyO3 are planned.
-
 ## Performance
 
 Criterion-based benchmarks cover sequential writes, random writes, point reads,
@@ -154,9 +148,6 @@ cargo bench -p xdb
 
 # Build with compression
 cargo build -p xdb --features compression
-
-# Build FFI bindings
-cargo build -p xdb-ffi
 ```
 
 ## License
