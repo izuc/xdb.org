@@ -57,6 +57,20 @@ impl WriteBatch {
         self.data.extend_from_slice(key);
     }
 
+    /// Append a `DeleteRange(start_key, end_key)` operation to the batch.
+    ///
+    /// Marks all keys in `[start_key, end_key)` as deleted.
+    pub fn delete_range(&mut self, start_key: &[u8], end_key: &[u8]) {
+        self.count += 1;
+        self.set_count_in_header(self.count);
+
+        self.data.push(ValueType::RangeDeletion as u8);
+        encode_varint32(&mut self.data, start_key.len() as u32);
+        self.data.extend_from_slice(start_key);
+        encode_varint32(&mut self.data, end_key.len() as u32);
+        self.data.extend_from_slice(end_key);
+    }
+
     /// Remove all buffered operations and reset the header.
     pub fn clear(&mut self) {
         self.data.truncate(HEADER_SIZE);
@@ -118,6 +132,20 @@ impl WriteBatch {
                 Some(ValueType::Deletion) => {
                     let key = Self::decode_delete_record(&self.data, &mut pos)?;
                     handler.delete(key);
+                }
+                Some(ValueType::RangeDeletion) => {
+                    // Range deletion: start_key + end_key
+                    let (start_len, n) = decode_varint32(&self.data[pos..])
+                        .ok_or_else(|| error::Error::corruption("truncated varint in batch"))?;
+                    pos += n;
+                    let start_key = &self.data[pos..pos + start_len as usize];
+                    pos += start_len as usize;
+                    let (end_len, n) = decode_varint32(&self.data[pos..])
+                        .ok_or_else(|| error::Error::corruption("truncated varint in batch"))?;
+                    pos += n;
+                    let end_key = &self.data[pos..pos + end_len as usize];
+                    pos += end_len as usize;
+                    handler.delete_range(start_key, end_key);
                 }
                 None => {
                     return Err(error::Error::corruption(format!(
@@ -204,6 +232,11 @@ pub trait WriteBatchHandler {
     fn put(&mut self, key: &[u8], value: &[u8]);
     /// Called for each `Delete(key)` in the batch.
     fn delete(&mut self, key: &[u8]);
+    /// Called for each `DeleteRange(start_key, end_key)` in the batch.
+    ///
+    /// The default implementation is a no-op for backwards compatibility.
+    #[allow(unused_variables)]
+    fn delete_range(&mut self, start_key: &[u8], end_key: &[u8]) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +256,7 @@ mod tests {
     enum Op {
         Put(Vec<u8>, Vec<u8>),
         Delete(Vec<u8>),
+        DeleteRange(Vec<u8>, Vec<u8>),
     }
 
     impl WriteBatchHandler for Recorder {
@@ -231,6 +265,10 @@ mod tests {
         }
         fn delete(&mut self, key: &[u8]) {
             self.ops.push(Op::Delete(key.to_vec()));
+        }
+        fn delete_range(&mut self, start_key: &[u8], end_key: &[u8]) {
+            self.ops
+                .push(Op::DeleteRange(start_key.to_vec(), end_key.to_vec()));
         }
     }
 
@@ -345,5 +383,64 @@ mod tests {
 
         assert_eq!(recorder.ops.len(), 1);
         assert_eq!(recorder.ops[0], Op::Put(big_key, big_value));
+    }
+
+    #[test]
+    fn delete_range_roundtrip() {
+        let mut batch = WriteBatch::new();
+        batch.put(b"a", b"val_a");
+        batch.delete_range(b"b", b"d");
+        batch.delete(b"e");
+
+        assert_eq!(batch.count(), 3);
+
+        let mut recorder = Recorder { ops: Vec::new() };
+        batch.iterate(&mut recorder).unwrap();
+
+        assert_eq!(
+            recorder.ops,
+            vec![
+                Op::Put(b"a".to_vec(), b"val_a".to_vec()),
+                Op::DeleteRange(b"b".to_vec(), b"d".to_vec()),
+                Op::Delete(b"e".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn delete_range_only() {
+        let mut batch = WriteBatch::new();
+        batch.delete_range(b"start", b"end");
+
+        assert_eq!(batch.count(), 1);
+
+        let mut recorder = Recorder { ops: Vec::new() };
+        batch.iterate(&mut recorder).unwrap();
+
+        assert_eq!(recorder.ops.len(), 1);
+        assert_eq!(
+            recorder.ops[0],
+            Op::DeleteRange(b"start".to_vec(), b"end".to_vec())
+        );
+    }
+
+    #[test]
+    fn multiple_delete_ranges() {
+        let mut batch = WriteBatch::new();
+        batch.delete_range(b"a", b"c");
+        batch.delete_range(b"m", b"z");
+
+        assert_eq!(batch.count(), 2);
+
+        let mut recorder = Recorder { ops: Vec::new() };
+        batch.iterate(&mut recorder).unwrap();
+
+        assert_eq!(
+            recorder.ops,
+            vec![
+                Op::DeleteRange(b"a".to_vec(), b"c".to_vec()),
+                Op::DeleteRange(b"m".to_vec(), b"z".to_vec()),
+            ]
+        );
     }
 }

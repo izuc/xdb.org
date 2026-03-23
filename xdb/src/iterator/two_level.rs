@@ -1,22 +1,21 @@
 //! Two-level iterator for SST table reads.
 //!
-//! Uses an index-level iterator to locate data blocks, then iterates
-//! within each data block.  This is used internally by `TableReader`.
+//! Two-level iteration is handled directly by
+//! [`TableIterator`](crate::sst::table_reader::TableIterator), which uses an
+//! index block to locate data blocks and iterates within each one.
 //!
-//! In Phase 1, `TableReader` handles two-level iteration inline rather
-//! than through this module.  This module is reserved for Phase 2
-//! optimization.
+//! This module is retained as a placeholder for a future standalone
+//! `TwoLevelIterator` component if the logic is factored out of
+//! `TableReader`.
 
 #![allow(dead_code, unused_imports)]
 
 use super::XdbIterator;
 
-/// Placeholder for Phase 2 two-level iterator.
+/// Placeholder for a future standalone two-level iterator.
 ///
-/// Currently, `TableReader` implements two-level iteration internally.
-/// This struct will be fleshed out when we factor the two-level logic
-/// out of `TableReader` into a reusable component.
+/// Currently, `TableIterator` implements two-level iteration internally
+/// (including `seek_to_last` / `prev` for reverse scanning).
 pub struct TwoLevelIterator {
-    // Will be implemented in Phase 2.
     _private: (),
 }

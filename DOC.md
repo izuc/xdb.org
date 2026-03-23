@@ -77,6 +77,13 @@ into ~8,800 lines of idiomatic, safe Rust.
 - Background compaction (runs in a separate thread, releases lock during I/O)
 - Statistics counters (atomic, lock-free observability)
 
+**Phase 3 — Advanced Features:**
+- Reverse iteration (`seek_to_last()`, `prev()` on all iterators)
+- Range deletes (`delete_range()` with tombstone filtering in reads and compaction)
+- Rate limiter (token bucket algorithm for background I/O throttling)
+- Integration tests (23 end-to-end tests: CRUD, persistence, recovery, compaction, snapshots, concurrency)
+- Benchmarks (Criterion: sequential/random writes, reads, scans, mixed workloads)
+
 ---
 
 ## Architecture
@@ -197,8 +204,9 @@ cheaply cloned and shared across threads.
 | `write` | `fn write(&self, opts: WriteOptions, batch: WriteBatch) -> Result<()>` | Apply a batch atomically. |
 | `flush` | `fn flush(&self) -> Result<()>` | Force the memtable to disk. |
 | `close` | `fn close(&self) -> Result<()>` | Graceful shutdown. |
-| `iter` | `fn iter(&self) -> DbIterator` | Forward iterator over all entries. |
+| `iter` | `fn iter(&self) -> DbIterator` | Forward/backward iterator over all entries. |
 | `iter_with_snapshot` | `fn iter_with_snapshot(&self, snap: &Snapshot) -> DbIterator` | Iterator at a snapshot. |
+| `delete_range` | `fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()>` | Delete all keys in `[start, end)`. |
 | `snapshot` | `fn snapshot(&self) -> Arc<Snapshot>` | Create a point-in-time snapshot. |
 | `release_snapshot` | `fn release_snapshot(&self, snap: &Snapshot)` | Release a snapshot. |
 | `stats` | `fn stats(&self) -> &Statistics` | Get live statistics counters. |
@@ -810,15 +818,7 @@ xdb covers the core 90% of functionality that most applications need, in
 
 ---
 
-## Future Work (Phase 3+)
-
-### Phase 3 — Advanced Features
-- **Range deletes**: Efficient deletion of key ranges
-- **Prefix seek**: Optimized iteration within a key prefix
-- **Partitioned index/filters**: For large SST files (> 64 MiB)
-- **Async I/O**: io_uring on Linux for non-blocking reads
-- **Custom comparators**: User-defined key ordering
-- **Streaming iterators**: Lazy two-level iterator over SST files
+## Future Work (Phase 4+)
 
 ### Phase 4 — Ecosystem
 - **C FFI**: For embedding in non-Rust projects

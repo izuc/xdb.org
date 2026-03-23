@@ -38,6 +38,7 @@ pub mod snapshot;
 pub mod db_iter;
 pub mod stats;
 pub mod compaction;
+pub mod rate_limiter;
 pub mod db;
 
 // Re-export the main public API at crate root.
@@ -48,3 +49,4 @@ pub use batch::WriteBatch;
 pub use snapshot::Snapshot;
 pub use db_iter::DbIterator;
 pub use stats::Statistics;
+pub use rate_limiter::RateLimiter;

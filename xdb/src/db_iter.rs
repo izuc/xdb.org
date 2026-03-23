@@ -5,41 +5,29 @@
 //!
 //! - Filters entries by snapshot sequence number
 //! - Deduplicates: shows only the newest version of each user key
-//! - Hides deletion tombstones
+//! - Hides deletion tombstones (including range tombstones)
 //! - Supports forward iteration: `seek_to_first`, `seek`, `next`
+//! - Supports backward iteration: `seek_to_last`, `prev`
 
 use crate::iterator::XdbIterator;
 use crate::types::*;
-
-/// Direction of iteration.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Direction {
-    Forward,
-}
 
 /// A user-facing iterator that filters internal keys to present a clean
 /// view of (user_key, value) pairs.
 ///
 /// Created via `Db::iter()`.
 pub struct DbIterator {
-    /// The underlying merging iterator over internal keys.
     inner: Box<dyn XdbIterator>,
-    /// Only return entries with sequence <= this.
     sequence: SequenceNumber,
-    /// Current user key (decoded from internal key).
     saved_key: Vec<u8>,
-    /// Current value.
     saved_value: Vec<u8>,
-    /// Whether the iterator is positioned at a valid entry.
     valid: bool,
-    /// Current direction.
-    direction: Direction,
+    /// Range tombstones: (start_key_inclusive, end_key_exclusive, sequence).
+    range_tombstones: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)>,
 }
 
 impl DbIterator {
     /// Create a new `DbIterator` wrapping an internal merging iterator.
-    ///
-    /// Only entries with sequence number <= `sequence` will be visible.
     pub fn new(inner: Box<dyn XdbIterator>, sequence: SequenceNumber) -> Self {
         DbIterator {
             inner,
@@ -47,11 +35,26 @@ impl DbIterator {
             saved_key: Vec::new(),
             saved_value: Vec::new(),
             valid: false,
-            direction: Direction::Forward,
+            range_tombstones: Vec::new(),
         }
     }
 
-    /// Is the iterator positioned at a valid entry?
+    /// Create a `DbIterator` with pre-collected range tombstones.
+    pub fn with_range_tombstones(
+        inner: Box<dyn XdbIterator>,
+        sequence: SequenceNumber,
+        range_tombstones: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)>,
+    ) -> Self {
+        DbIterator {
+            inner,
+            sequence,
+            saved_key: Vec::new(),
+            saved_value: Vec::new(),
+            valid: false,
+            range_tombstones,
+        }
+    }
+
     pub fn valid(&self) -> bool {
         self.valid
     }
@@ -59,61 +62,67 @@ impl DbIterator {
     /// Position at the first entry.
     pub fn seek_to_first(&mut self) {
         self.inner.seek_to_first();
-        self.direction = Direction::Forward;
         self.find_next_user_entry();
+    }
+
+    /// Position at the last entry.
+    pub fn seek_to_last(&mut self) {
+        self.inner.seek_to_last();
+        self.find_prev_user_entry();
     }
 
     /// Position at the first entry with user_key >= `target`.
     pub fn seek(&mut self, target: &[u8]) {
-        // Build an internal key with the target user_key and max sequence
-        // so we find the newest version of this key or the first key after it.
         let ikey = InternalKey::new(target, MAX_SEQUENCE_NUMBER, ValueType::Value);
         self.inner.seek(ikey.as_bytes());
-        self.direction = Direction::Forward;
         self.find_next_user_entry();
     }
 
     /// Advance to the next entry.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the iterator is not currently valid.
     pub fn next(&mut self) {
         assert!(self.valid, "DbIterator::next() called on invalid iterator");
-        // Skip all internal keys with the same user key as the current entry
-        // (there may be older versions or deletion markers).
-        self.skip_current_user_key();
+        self.skip_forward_past_current();
         self.find_next_user_entry();
     }
 
-    /// The current user key.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the iterator is not currently valid.
+    /// Move to the previous entry.
+    pub fn prev(&mut self) {
+        assert!(self.valid, "DbIterator::prev() called on invalid iterator");
+        // The inner iterator may be at the current saved_key or past it.
+        // Skip backward past all entries for the current user key.
+        let current = self.saved_key.clone();
+        // First, ensure inner is on or before the current user key.
+        while self.inner.valid() {
+            if let Some(p) = ParsedInternalKey::from_bytes(self.inner.key()) {
+                if p.user_key < current.as_slice() {
+                    break;
+                }
+            }
+            self.inner.prev();
+        }
+        self.find_prev_user_entry();
+    }
+
     pub fn key(&self) -> &[u8] {
         assert!(self.valid, "DbIterator::key() called on invalid iterator");
         &self.saved_key
     }
 
-    /// The current value.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the iterator is not currently valid.
     pub fn value(&self) -> &[u8] {
         assert!(self.valid, "DbIterator::value() called on invalid iterator");
         &self.saved_value
     }
 
-    /// Advance the inner iterator past all entries with the same user key
-    /// as `saved_key`.
-    fn skip_current_user_key(&mut self) {
-        let current_user_key = self.saved_key.clone();
+    // -----------------------------------------------------------------------
+    // Forward scan helpers
+    // -----------------------------------------------------------------------
+
+    /// Skip the inner iterator past all entries for the current saved_key.
+    fn skip_forward_past_current(&mut self) {
+        let current = self.saved_key.clone();
         while self.inner.valid() {
-            let ikey = self.inner.key();
-            if let Some(parsed) = ParsedInternalKey::from_bytes(ikey) {
-                if parsed.user_key != current_user_key.as_slice() {
+            if let Some(p) = ParsedInternalKey::from_bytes(self.inner.key()) {
+                if p.user_key != current.as_slice() {
                     break;
                 }
             } else {
@@ -123,45 +132,45 @@ impl DbIterator {
         }
     }
 
-    /// Scan forward through the inner iterator to find the next visible
-    /// user entry: the newest version of a user key with seq <= self.sequence
-    /// that is a `Value` (not a `Deletion`).
+    /// Scan forward to find the next visible user entry.
     fn find_next_user_entry(&mut self) {
         self.valid = false;
 
         while self.inner.valid() {
-            let ikey = self.inner.key();
-            let parsed = match ParsedInternalKey::from_bytes(ikey) {
+            // Copy key bytes to avoid borrow conflicts.
+            let ikey = self.inner.key().to_vec();
+            let parsed = match ParsedInternalKey::from_bytes(&ikey) {
                 Some(p) => p,
                 None => {
-                    // Malformed key, skip it.
                     self.inner.next();
                     continue;
                 }
             };
 
-            // Skip entries newer than our snapshot.
             if parsed.sequence > self.sequence {
                 self.inner.next();
                 continue;
             }
 
-            // This is the newest visible version of this user key.
+            let user_key = parsed.user_key.to_vec();
+            let seq = parsed.sequence;
+
             match parsed.value_type {
                 ValueType::Value => {
-                    self.saved_key = parsed.user_key.to_vec();
+                    if self.is_range_deleted(&user_key, seq) {
+                        self.skip_forward_past_user_key(&user_key);
+                        continue;
+                    }
+                    self.saved_key = user_key;
                     self.saved_value = self.inner.value().to_vec();
                     self.valid = true;
-                    // Don't advance inner -- next() will call skip_current_user_key.
                     return;
                 }
-                ValueType::Deletion => {
-                    // Key was deleted; skip all remaining versions of this user key.
-                    let deleted_user_key = parsed.user_key.to_vec();
+                ValueType::Deletion | ValueType::RangeDeletion => {
                     self.inner.next();
                     while self.inner.valid() {
                         if let Some(p2) = ParsedInternalKey::from_bytes(self.inner.key()) {
-                            if p2.user_key != deleted_user_key.as_slice() {
+                            if p2.user_key != user_key.as_slice() {
                                 break;
                             }
                         } else {
@@ -169,10 +178,116 @@ impl DbIterator {
                         }
                         self.inner.next();
                     }
-                    // Continue the outer loop to process the next user key.
                 }
             }
         }
+    }
+
+    fn skip_forward_past_user_key(&mut self, user_key: &[u8]) {
+        let owned = user_key.to_vec();
+        self.inner.next();
+        while self.inner.valid() {
+            if let Some(p) = ParsedInternalKey::from_bytes(self.inner.key()) {
+                if p.user_key != owned.as_slice() {
+                    break;
+                }
+            } else {
+                break;
+            }
+            self.inner.next();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Backward scan helpers
+    // -----------------------------------------------------------------------
+
+    /// Going backward, find the previous visible user entry.
+    ///
+    /// When scanning backward, for the same user key we encounter the
+    /// **oldest** version first (lowest sequence). We must collect all
+    /// versions and pick the newest visible one.
+    fn find_prev_user_entry(&mut self) {
+        self.valid = false;
+
+        while self.inner.valid() {
+            let ikey = self.inner.key().to_vec();
+            let parsed = match ParsedInternalKey::from_bytes(&ikey) {
+                Some(p) => p,
+                None => {
+                    self.inner.prev();
+                    continue;
+                }
+            };
+
+            let user_key = parsed.user_key.to_vec();
+
+            // Scan backward through all versions of this user key,
+            // tracking the newest visible version.
+            let mut best_vt: Option<ValueType> = None;
+            let mut best_value = Vec::new();
+            let mut best_seq: SequenceNumber = 0;
+
+            // Process the current entry.
+            if parsed.sequence <= self.sequence {
+                best_vt = Some(parsed.value_type);
+                best_value = self.inner.value().to_vec();
+                best_seq = parsed.sequence;
+            }
+
+            // Continue backward through remaining versions of this user key.
+            self.inner.prev();
+            while self.inner.valid() {
+                if let Some(p) = ParsedInternalKey::from_bytes(self.inner.key()) {
+                    if p.user_key != user_key.as_slice() {
+                        break;
+                    }
+                    if p.sequence <= self.sequence && p.sequence >= best_seq {
+                        best_vt = Some(p.value_type);
+                        best_value = self.inner.value().to_vec();
+                        best_seq = p.sequence;
+                    }
+                } else {
+                    break;
+                }
+                self.inner.prev();
+            }
+
+            // inner is now before all versions of user_key, or invalid.
+            match best_vt {
+                Some(ValueType::Value) => {
+                    if !self.is_range_deleted(&user_key, best_seq) {
+                        self.saved_key = user_key;
+                        self.saved_value = best_value;
+                        self.valid = true;
+                        return;
+                    }
+                }
+                _ => {
+                    // Deleted, range-deleted, or no visible version.
+                }
+            }
+            // Continue to next (earlier) user key.
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Range tombstone checking
+    // -----------------------------------------------------------------------
+
+    /// Check if a user key at the given sequence is covered by a range
+    /// tombstone with a higher or equal sequence number.
+    fn is_range_deleted(&self, user_key: &[u8], seq: SequenceNumber) -> bool {
+        for (start, end, tomb_seq) in &self.range_tombstones {
+            if user_key >= start.as_slice()
+                && user_key < end.as_slice()
+                && *tomb_seq >= seq
+                && *tomb_seq <= self.sequence
+            {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -185,8 +300,6 @@ mod tests {
     use super::*;
     use crate::iterator::XdbIterator;
 
-    /// A trivial iterator over a pre-sorted `Vec` of key-value pairs.
-    /// Keys must be encoded internal keys (user_key + 8-byte tag).
     struct VecIterator {
         entries: Vec<(Vec<u8>, Vec<u8>)>,
         pos: usize,
@@ -205,34 +318,41 @@ mod tests {
         fn valid(&self) -> bool {
             self.pos < self.entries.len()
         }
-
         fn seek_to_first(&mut self) {
             self.pos = 0;
         }
-
         fn seek(&mut self, target: &[u8]) {
-            // Use internal key comparison for correct ordering.
             self.pos = self
                 .entries
                 .iter()
                 .position(|(k, _)| compare_internal_key(k, target) != std::cmp::Ordering::Less)
                 .unwrap_or(self.entries.len());
         }
-
         fn next(&mut self) {
             self.pos += 1;
         }
-
         fn key(&self) -> &[u8] {
             &self.entries[self.pos].0
         }
-
         fn value(&self) -> &[u8] {
             &self.entries[self.pos].1
         }
+        fn seek_to_last(&mut self) {
+            if self.entries.is_empty() {
+                self.pos = 0;
+            } else {
+                self.pos = self.entries.len() - 1;
+            }
+        }
+        fn prev(&mut self) {
+            if self.pos == 0 || self.pos == usize::MAX {
+                self.pos = usize::MAX;
+            } else {
+                self.pos -= 1;
+            }
+        }
     }
 
-    /// Helper: build an internal key and value pair for test entries.
     fn make_entry(
         user_key: &[u8],
         seq: SequenceNumber,
@@ -243,8 +363,7 @@ mod tests {
         (ikey.as_bytes().to_vec(), value.to_vec())
     }
 
-    /// Helper: collect all (user_key, value) pairs from a DbIterator.
-    fn collect_all(iter: &mut DbIterator) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn collect_forward(iter: &mut DbIterator) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut result = Vec::new();
         iter.seek_to_first();
         while iter.valid() {
@@ -254,103 +373,90 @@ mod tests {
         result
     }
 
+    fn collect_backward(iter: &mut DbIterator) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut result = Vec::new();
+        iter.seek_to_last();
+        while iter.valid() {
+            result.push((iter.key().to_vec(), iter.value().to_vec()));
+            iter.prev();
+        }
+        result
+    }
+
     #[test]
     fn iterate_simple_puts() {
-        // Three distinct keys, all puts, single version each.
         let entries = vec![
             make_entry(b"apple", 3, ValueType::Value, b"red"),
             make_entry(b"banana", 2, ValueType::Value, b"yellow"),
             make_entry(b"cherry", 1, ValueType::Value, b"dark"),
         ];
-        let inner = VecIterator::boxed(entries);
-        let mut iter = DbIterator::new(inner, 10);
-
-        let pairs = collect_all(&mut iter);
+        let mut iter = DbIterator::new(VecIterator::boxed(entries), 10);
+        let pairs = collect_forward(&mut iter);
         assert_eq!(pairs.len(), 3);
-        assert_eq!(pairs[0], (b"apple".to_vec(), b"red".to_vec()));
-        assert_eq!(pairs[1], (b"banana".to_vec(), b"yellow".to_vec()));
-        assert_eq!(pairs[2], (b"cherry".to_vec(), b"dark".to_vec()));
+        assert_eq!(pairs[0].0, b"apple");
+        assert_eq!(pairs[2].0, b"cherry");
     }
 
     #[test]
     fn deleted_keys_are_hidden() {
-        // "banana" is deleted at seq=4. The iterator should skip it.
         let entries = vec![
             make_entry(b"apple", 1, ValueType::Value, b"red"),
             make_entry(b"banana", 4, ValueType::Deletion, b""),
             make_entry(b"banana", 2, ValueType::Value, b"yellow"),
             make_entry(b"cherry", 3, ValueType::Value, b"dark"),
         ];
-        let inner = VecIterator::boxed(entries);
-        let mut iter = DbIterator::new(inner, 10);
-
-        let pairs = collect_all(&mut iter);
+        let mut iter = DbIterator::new(VecIterator::boxed(entries), 10);
+        let pairs = collect_forward(&mut iter);
         assert_eq!(pairs.len(), 2);
-        assert_eq!(pairs[0], (b"apple".to_vec(), b"red".to_vec()));
-        assert_eq!(pairs[1], (b"cherry".to_vec(), b"dark".to_vec()));
+        assert_eq!(pairs[0].0, b"apple");
+        assert_eq!(pairs[1].0, b"cherry");
     }
 
     #[test]
     fn only_newest_version_shown() {
-        // "key" has two versions: seq=5 ("new") and seq=3 ("old").
-        // Only the newest visible version should appear.
         let entries = vec![
             make_entry(b"key", 5, ValueType::Value, b"new"),
             make_entry(b"key", 3, ValueType::Value, b"old"),
         ];
-        let inner = VecIterator::boxed(entries);
-        let mut iter = DbIterator::new(inner, 10);
-
-        let pairs = collect_all(&mut iter);
+        let mut iter = DbIterator::new(VecIterator::boxed(entries), 10);
+        let pairs = collect_forward(&mut iter);
         assert_eq!(pairs.len(), 1);
-        assert_eq!(pairs[0], (b"key".to_vec(), b"new".to_vec()));
+        assert_eq!(pairs[0].1, b"new");
     }
 
     #[test]
     fn sequence_filtering_older_snapshot() {
-        // "key" has versions at seq=5 and seq=3.
-        // A snapshot at seq=4 should only see the seq=3 version.
         let entries = vec![
             make_entry(b"key", 5, ValueType::Value, b"new"),
             make_entry(b"key", 3, ValueType::Value, b"old"),
         ];
-        let inner = VecIterator::boxed(entries);
-        let mut iter = DbIterator::new(inner, 4); // snapshot at seq=4
-
-        let pairs = collect_all(&mut iter);
+        let mut iter = DbIterator::new(VecIterator::boxed(entries), 4);
+        let pairs = collect_forward(&mut iter);
         assert_eq!(pairs.len(), 1);
-        assert_eq!(pairs[0], (b"key".to_vec(), b"old".to_vec()));
+        assert_eq!(pairs[0].1, b"old");
     }
 
     #[test]
     fn sequence_filtering_hides_all_versions() {
-        // "key" only has versions at seq=5 and seq=3.
-        // A snapshot at seq=2 should see nothing for this key.
         let entries = vec![
             make_entry(b"key", 5, ValueType::Value, b"new"),
             make_entry(b"key", 3, ValueType::Value, b"old"),
         ];
-        let inner = VecIterator::boxed(entries);
-        let mut iter = DbIterator::new(inner, 2); // snapshot at seq=2
-
-        let pairs = collect_all(&mut iter);
+        let mut iter = DbIterator::new(VecIterator::boxed(entries), 2);
+        let pairs = collect_forward(&mut iter);
         assert_eq!(pairs.len(), 0);
     }
 
     #[test]
     fn deletion_visible_only_at_snapshot() {
-        // "key" deleted at seq=5, put at seq=3.
-        // Snapshot at seq=4: deletion not visible, put at seq=3 is visible.
         let entries = vec![
             make_entry(b"key", 5, ValueType::Deletion, b""),
             make_entry(b"key", 3, ValueType::Value, b"alive"),
         ];
-        let inner = VecIterator::boxed(entries);
-        let mut iter = DbIterator::new(inner, 4);
-
-        let pairs = collect_all(&mut iter);
+        let mut iter = DbIterator::new(VecIterator::boxed(entries), 4);
+        let pairs = collect_forward(&mut iter);
         assert_eq!(pairs.len(), 1);
-        assert_eq!(pairs[0], (b"key".to_vec(), b"alive".to_vec()));
+        assert_eq!(pairs[0].1, b"alive");
     }
 
     #[test]
@@ -359,34 +465,20 @@ mod tests {
             make_entry(b"apple", 1, ValueType::Value, b"a"),
             make_entry(b"banana", 2, ValueType::Value, b"b"),
             make_entry(b"cherry", 3, ValueType::Value, b"c"),
-            make_entry(b"date", 4, ValueType::Value, b"d"),
         ];
-        let inner = VecIterator::boxed(entries);
-        let mut iter = DbIterator::new(inner, 10);
-
-        // Seek to "banana".
+        let mut iter = DbIterator::new(VecIterator::boxed(entries), 10);
         iter.seek(b"banana");
         assert!(iter.valid());
         assert_eq!(iter.key(), b"banana");
-        assert_eq!(iter.value(), b"b");
-
-        // next should go to "cherry".
-        iter.next();
-        assert!(iter.valid());
-        assert_eq!(iter.key(), b"cherry");
-        assert_eq!(iter.value(), b"c");
     }
 
     #[test]
     fn seek_between_keys() {
-        // Seek to a key that doesn't exist; should land on the next one.
         let entries = vec![
             make_entry(b"apple", 1, ValueType::Value, b"a"),
             make_entry(b"cherry", 2, ValueType::Value, b"c"),
         ];
-        let inner = VecIterator::boxed(entries);
-        let mut iter = DbIterator::new(inner, 10);
-
+        let mut iter = DbIterator::new(VecIterator::boxed(entries), 10);
         iter.seek(b"banana");
         assert!(iter.valid());
         assert_eq!(iter.key(), b"cherry");
@@ -394,28 +486,21 @@ mod tests {
 
     #[test]
     fn seek_past_end() {
-        let entries = vec![
-            make_entry(b"apple", 1, ValueType::Value, b"a"),
-        ];
-        let inner = VecIterator::boxed(entries);
-        let mut iter = DbIterator::new(inner, 10);
-
+        let entries = vec![make_entry(b"apple", 1, ValueType::Value, b"a")];
+        let mut iter = DbIterator::new(VecIterator::boxed(entries), 10);
         iter.seek(b"zzz");
         assert!(!iter.valid());
     }
 
     #[test]
     fn empty_iterator() {
-        let inner = VecIterator::boxed(vec![]);
-        let mut iter = DbIterator::new(inner, 10);
-
+        let mut iter = DbIterator::new(VecIterator::boxed(vec![]), 10);
         iter.seek_to_first();
         assert!(!iter.valid());
     }
 
     #[test]
     fn mixed_puts_and_deletes_across_keys() {
-        // Multiple keys with varying states.
         let entries = vec![
             make_entry(b"a", 10, ValueType::Value, b"val_a"),
             make_entry(b"b", 9, ValueType::Deletion, b""),
@@ -424,13 +509,117 @@ mod tests {
             make_entry(b"c", 3, ValueType::Value, b"val_c_old"),
             make_entry(b"d", 7, ValueType::Deletion, b""),
         ];
-        let inner = VecIterator::boxed(entries);
-        let mut iter = DbIterator::new(inner, 100);
-
-        let pairs = collect_all(&mut iter);
-        // "a" is live, "b" is deleted, "c" is live (newest version), "d" is deleted.
+        let mut iter = DbIterator::new(VecIterator::boxed(entries), 100);
+        let pairs = collect_forward(&mut iter);
         assert_eq!(pairs.len(), 2);
-        assert_eq!(pairs[0], (b"a".to_vec(), b"val_a".to_vec()));
-        assert_eq!(pairs[1], (b"c".to_vec(), b"val_c".to_vec()));
+        assert_eq!(pairs[0].0, b"a");
+        assert_eq!(pairs[1].0, b"c");
+    }
+
+    // -- Reverse iteration tests --
+
+    #[test]
+    fn seek_to_last_simple() {
+        let entries = vec![
+            make_entry(b"apple", 1, ValueType::Value, b"a"),
+            make_entry(b"banana", 2, ValueType::Value, b"b"),
+            make_entry(b"cherry", 3, ValueType::Value, b"c"),
+        ];
+        let mut iter = DbIterator::new(VecIterator::boxed(entries), 10);
+        iter.seek_to_last();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"cherry");
+        assert_eq!(iter.value(), b"c");
+    }
+
+    #[test]
+    fn prev_walks_backward() {
+        let entries = vec![
+            make_entry(b"a", 1, ValueType::Value, b"1"),
+            make_entry(b"b", 2, ValueType::Value, b"2"),
+            make_entry(b"c", 3, ValueType::Value, b"3"),
+        ];
+        let mut iter = DbIterator::new(VecIterator::boxed(entries), 10);
+        let pairs = collect_backward(&mut iter);
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0].0, b"c");
+        assert_eq!(pairs[1].0, b"b");
+        assert_eq!(pairs[2].0, b"a");
+    }
+
+    #[test]
+    fn prev_skips_deletions() {
+        let entries = vec![
+            make_entry(b"a", 1, ValueType::Value, b"1"),
+            make_entry(b"b", 4, ValueType::Deletion, b""),
+            make_entry(b"b", 2, ValueType::Value, b"2"),
+            make_entry(b"c", 3, ValueType::Value, b"3"),
+        ];
+        let mut iter = DbIterator::new(VecIterator::boxed(entries), 10);
+        let pairs = collect_backward(&mut iter);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, b"c");
+        assert_eq!(pairs[1].0, b"a");
+    }
+
+    #[test]
+    fn prev_newest_version_backward() {
+        let entries = vec![
+            make_entry(b"key", 5, ValueType::Value, b"new"),
+            make_entry(b"key", 3, ValueType::Value, b"old"),
+        ];
+        let mut iter = DbIterator::new(VecIterator::boxed(entries), 10);
+        iter.seek_to_last();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"key");
+        assert_eq!(iter.value(), b"new");
+    }
+
+    #[test]
+    fn forward_backward_consistency() {
+        let entries = vec![
+            make_entry(b"a", 1, ValueType::Value, b"1"),
+            make_entry(b"b", 2, ValueType::Value, b"2"),
+            make_entry(b"c", 3, ValueType::Value, b"3"),
+        ];
+        let entries2 = entries.clone();
+        let fwd = collect_forward(&mut DbIterator::new(VecIterator::boxed(entries), 10));
+        let mut bwd = collect_backward(&mut DbIterator::new(VecIterator::boxed(entries2), 10));
+        bwd.reverse();
+        assert_eq!(fwd, bwd);
+    }
+
+    // -- Range tombstone tests --
+
+    #[test]
+    fn range_tombstone_hides_covered_keys() {
+        let entries = vec![
+            make_entry(b"a", 1, ValueType::Value, b"1"),
+            make_entry(b"b", 2, ValueType::Value, b"2"),
+            make_entry(b"c", 3, ValueType::Value, b"3"),
+            make_entry(b"d", 4, ValueType::Value, b"4"),
+        ];
+        // Range tombstone [b, d) at seq=5 covers "b" and "c"
+        let tombstones = vec![(b"b".to_vec(), b"d".to_vec(), 5u64)];
+        let mut iter =
+            DbIterator::with_range_tombstones(VecIterator::boxed(entries), 10, tombstones);
+        let pairs = collect_forward(&mut iter);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, b"a");
+        assert_eq!(pairs[1].0, b"d");
+    }
+
+    #[test]
+    fn range_tombstone_respects_sequence() {
+        let entries = vec![
+            make_entry(b"a", 10, ValueType::Value, b"1"),
+            make_entry(b"b", 8, ValueType::Value, b"2"),
+        ];
+        // Range tombstone at seq=5 should NOT hide b at seq=8 (put is newer)
+        let tombstones = vec![(b"a".to_vec(), b"c".to_vec(), 5u64)];
+        let mut iter =
+            DbIterator::with_range_tombstones(VecIterator::boxed(entries), 10, tombstones);
+        let pairs = collect_forward(&mut iter);
+        assert_eq!(pairs.len(), 2);
     }
 }

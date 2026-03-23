@@ -27,6 +27,9 @@ pub enum ValueType {
     Deletion = 0,
     /// A normal put.
     Value = 1,
+    /// A range deletion tombstone: the user key is the start and the value
+    /// holds the exclusive end key.
+    RangeDeletion = 2,
 }
 
 impl ValueType {
@@ -35,6 +38,7 @@ impl ValueType {
         match v {
             0 => Some(ValueType::Deletion),
             1 => Some(ValueType::Value),
+            2 => Some(ValueType::RangeDeletion),
             _ => None,
         }
     }

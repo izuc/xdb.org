@@ -1,5 +1,6 @@
 //! Database configuration.
 
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Compression
@@ -98,6 +99,10 @@ pub struct Options {
     /// Maximum concurrent background flushes.  Default: 1.
     pub max_background_flushes: usize,
 
+    /// Optional rate limiter for background I/O (flush + compaction).
+    /// If `None`, background I/O is unlimited.
+    pub rate_limiter: Option<Arc<crate::rate_limiter::RateLimiter>>,
+
     // -- WAL -----------------------------------------------------------------
     /// If true, every write is fsynced to the WAL before returning.
     /// Default: false (rely on OS page cache for batching).
@@ -130,6 +135,8 @@ impl Default for Options {
 
             max_background_compactions: 1,
             max_background_flushes: 1,
+
+            rate_limiter: None,
 
             sync_writes: false,
         }
@@ -182,6 +189,12 @@ impl Options {
     /// Builder-style: set maximum number of open SST files in the table cache.
     pub fn max_open_files(mut self, n: usize) -> Self {
         self.max_open_files = n;
+        self
+    }
+
+    /// Builder-style: set rate limiter for background I/O.
+    pub fn rate_limiter(mut self, limiter: Arc<crate::rate_limiter::RateLimiter>) -> Self {
+        self.rate_limiter = Some(limiter);
         self
     }
 

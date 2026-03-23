@@ -76,6 +76,36 @@ impl MergingIterator {
         }
         self.current = smallest_idx;
     }
+
+    /// Linear scan to find the child with the largest current key.
+    ///
+    /// On ties (equal keys), the child with the lower index wins
+    /// (newer data shadows older data).
+    fn find_largest(&mut self) {
+        self.current = None;
+        let mut largest_idx: Option<usize> = None;
+
+        for (i, child) in self.children.iter().enumerate() {
+            if !child.valid() {
+                continue;
+            }
+            match largest_idx {
+                None => {
+                    largest_idx = Some(i);
+                }
+                Some(li) => {
+                    let ord = (self.comparator)(child.key(), self.children[li].key());
+                    if ord == Ordering::Greater {
+                        largest_idx = Some(i);
+                    } else if ord == Ordering::Equal && i < li {
+                        // On ties, prefer the lower index (newer data).
+                        largest_idx = Some(i);
+                    }
+                }
+            }
+        }
+        self.current = largest_idx;
+    }
 }
 
 impl XdbIterator for MergingIterator {
@@ -111,6 +141,19 @@ impl XdbIterator for MergingIterator {
     fn value(&self) -> &[u8] {
         let idx = self.current.expect("value() called on invalid iterator");
         self.children[idx].value()
+    }
+
+    fn seek_to_last(&mut self) {
+        for child in &mut self.children {
+            child.seek_to_last();
+        }
+        self.find_largest();
+    }
+
+    fn prev(&mut self) {
+        let idx = self.current.expect("prev() called on invalid iterator");
+        self.children[idx].prev();
+        self.find_largest();
     }
 }
 
@@ -166,6 +209,22 @@ mod tests {
 
         fn value(&self) -> &[u8] {
             &self.entries[self.pos].1
+        }
+
+        fn seek_to_last(&mut self) {
+            if self.entries.is_empty() {
+                self.pos = usize::MAX;
+            } else {
+                self.pos = self.entries.len() - 1;
+            }
+        }
+
+        fn prev(&mut self) {
+            if self.pos == 0 {
+                self.pos = usize::MAX; // invalid
+            } else {
+                self.pos -= 1;
+            }
         }
     }
 
@@ -337,6 +396,98 @@ mod tests {
         assert_eq!(iter.value(), b"foo_100");
 
         iter.next();
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn merge_seek_to_last() {
+        let a = VecIterator::boxed(vec![
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"c".to_vec(), b"3".to_vec()),
+            (b"e".to_vec(), b"5".to_vec()),
+        ]);
+        let b = VecIterator::boxed(vec![
+            (b"b".to_vec(), b"2".to_vec()),
+            (b"d".to_vec(), b"4".to_vec()),
+            (b"f".to_vec(), b"6".to_vec()),
+        ]);
+
+        let mut iter = MergingIterator::with_comparator(vec![a, b], |x, y| x.cmp(y));
+        iter.seek_to_last();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"f");
+        assert_eq!(iter.value(), b"6");
+    }
+
+    #[test]
+    fn merge_prev_walks_backward() {
+        let a = VecIterator::boxed(vec![
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"c".to_vec(), b"3".to_vec()),
+            (b"e".to_vec(), b"5".to_vec()),
+        ]);
+        let b = VecIterator::boxed(vec![
+            (b"b".to_vec(), b"2".to_vec()),
+            (b"d".to_vec(), b"4".to_vec()),
+            (b"f".to_vec(), b"6".to_vec()),
+        ]);
+
+        let mut iter = MergingIterator::with_comparator(vec![a, b], |x, y| x.cmp(y));
+        iter.seek_to_last();
+
+        let mut backward_keys: Vec<Vec<u8>> = Vec::new();
+        while iter.valid() {
+            backward_keys.push(iter.key().to_vec());
+            iter.prev();
+        }
+
+        assert_eq!(
+            backward_keys,
+            vec![
+                b"f".to_vec(),
+                b"e".to_vec(),
+                b"d".to_vec(),
+                b"c".to_vec(),
+                b"b".to_vec(),
+                b"a".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_prev_at_first_entry() {
+        let a = VecIterator::boxed(vec![
+            (b"x".to_vec(), b"1".to_vec()),
+        ]);
+
+        let mut iter = MergingIterator::with_comparator(vec![a], |x, y| x.cmp(y));
+        iter.seek_to_first();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"x");
+
+        iter.prev();
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn merge_seek_to_last_with_empty_children() {
+        let a = VecIterator::boxed(vec![]);
+        let b = VecIterator::boxed(vec![
+            (b"only".to_vec(), b"one".to_vec()),
+        ]);
+        let c = VecIterator::boxed(vec![]);
+
+        let mut iter = MergingIterator::with_comparator(vec![a, b, c], |x, y| x.cmp(y));
+        iter.seek_to_last();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"only");
+        assert_eq!(iter.value(), b"one");
+    }
+
+    #[test]
+    fn merge_seek_to_last_all_empty() {
+        let mut iter = MergingIterator::with_comparator(vec![], |x, y| x.cmp(y));
+        iter.seek_to_last();
         assert!(!iter.valid());
     }
 }

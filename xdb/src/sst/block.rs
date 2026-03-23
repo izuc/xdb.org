@@ -196,6 +196,7 @@ impl BlockReader {
         BlockIterator {
             block: self,
             current: 0,
+            entry_offset: 0,
             key: Vec::new(),
             value_offset: 0,
             value_len: 0,
@@ -230,6 +231,8 @@ impl BlockReader {
 pub struct BlockIterator<'a> {
     block: &'a BlockReader,
     current: usize,
+    /// Offset where the current entry starts (before `current` was advanced).
+    entry_offset: usize,
     key: Vec<u8>,
     value_offset: usize,
     value_len: usize,
@@ -290,6 +293,104 @@ impl<'a> BlockIterator<'a> {
         self.parse_next_entry();
     }
 
+    /// Position at the last entry in the block.
+    pub fn seek_to_last(&mut self) {
+        if self.block.num_restarts == 0 {
+            self.valid = false;
+            return;
+        }
+        // Seek to the last restart point, then scan forward to the end.
+        let last_restart = self.block.num_restarts as usize - 1;
+        self.seek_to_restart(last_restart);
+        self.parse_next_entry();
+        if !self.valid {
+            return;
+        }
+        // Scan forward, keeping track of the last valid position.
+        loop {
+            let saved_entry_offset = self.entry_offset;
+            let saved_current = self.current;
+            let saved_key = self.key.clone();
+            let saved_value_offset = self.value_offset;
+            let saved_value_len = self.value_len;
+            let saved_restart_index = self.restart_index;
+            self.parse_next_entry();
+            if !self.valid {
+                // Went past the end -- restore to last valid position.
+                self.entry_offset = saved_entry_offset;
+                self.current = saved_current;
+                self.key = saved_key;
+                self.value_offset = saved_value_offset;
+                self.value_len = saved_value_len;
+                self.restart_index = saved_restart_index;
+                self.valid = true;
+                break;
+            }
+        }
+    }
+
+    /// Move to the previous entry.
+    ///
+    /// If already at the first entry, the iterator becomes invalid.
+    pub fn prev(&mut self) {
+        if !self.valid {
+            return;
+        }
+        let target_offset = self.entry_offset;
+
+        // If we are at the very first entry, there is no previous.
+        if target_offset == self.block.restart_offset(0) {
+            self.valid = false;
+            return;
+        }
+
+        // Find the restart point at or before the current entry.
+        let mut restart_idx = 0;
+        for i in 0..self.block.num_restarts as usize {
+            let roff = self.block.restart_offset(i);
+            if roff < target_offset {
+                restart_idx = i;
+            } else {
+                break;
+            }
+        }
+
+        // Seek to that restart point and scan forward until we reach
+        // the entry just before target_offset.
+        self.seek_to_restart(restart_idx);
+        self.parse_next_entry();
+        if !self.valid {
+            return;
+        }
+
+        loop {
+            if self.entry_offset == target_offset {
+                // Should not happen since we checked target > first entry,
+                // but guard anyway.
+                self.valid = false;
+                return;
+            }
+            let saved_entry_offset = self.entry_offset;
+            let saved_current = self.current;
+            let saved_key = self.key.clone();
+            let saved_value_offset = self.value_offset;
+            let saved_value_len = self.value_len;
+            let saved_restart_index = self.restart_index;
+            self.parse_next_entry();
+            if !self.valid || self.entry_offset >= target_offset {
+                // Restore to the entry just before target_offset.
+                self.entry_offset = saved_entry_offset;
+                self.current = saved_current;
+                self.key = saved_key;
+                self.value_offset = saved_value_offset;
+                self.value_len = saved_value_len;
+                self.restart_index = saved_restart_index;
+                self.valid = true;
+                break;
+            }
+        }
+    }
+
     /// Returns the current key. Only valid when [`valid`](Self::valid) is true.
     pub fn key(&self) -> &[u8] {
         debug_assert!(self.valid);
@@ -324,6 +425,7 @@ impl<'a> BlockIterator<'a> {
             return;
         }
 
+        self.entry_offset = self.current;
         let data = &self.block.data[self.current..self.block.data_end()];
 
         let (shared, n1) = match decode_varint32(data) {
@@ -626,6 +728,181 @@ mod tests {
         assert_eq!(iter.key(), b"x");
         assert_eq!(iter.value(), b"10");
         iter.next();
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn seek_to_last_single_entry() {
+        let data = build_block(&[(b"only", b"one")], 16);
+        let reader = BlockReader::new(data).unwrap();
+        let mut iter = reader.iter();
+
+        iter.seek_to_last();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"only");
+        assert_eq!(iter.value(), b"one");
+    }
+
+    #[test]
+    fn seek_to_last_positions_at_last_entry() {
+        let entries: Vec<(&[u8], &[u8])> =
+            vec![(b"aaa", b"1"), (b"bbb", b"2"), (b"ccc", b"3"), (b"ddd", b"4")];
+        let data = build_block(&entries, 2);
+        let reader = BlockReader::new(data).unwrap();
+        let mut iter = reader.iter();
+
+        iter.seek_to_last();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"ddd");
+        assert_eq!(iter.value(), b"4");
+    }
+
+    #[test]
+    fn seek_to_last_many_entries() {
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..200u32)
+            .map(|i| {
+                (
+                    format!("key-{:06}", i).into_bytes(),
+                    format!("val-{:06}", i).into_bytes(),
+                )
+            })
+            .collect();
+        let entry_refs: Vec<(&[u8], &[u8])> = entries
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+
+        let data = build_block(&entry_refs, 16);
+        let reader = BlockReader::new(data).unwrap();
+        let mut iter = reader.iter();
+
+        iter.seek_to_last();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"key-000199");
+        assert_eq!(iter.value(), b"val-000199");
+    }
+
+    #[test]
+    fn prev_walks_backward_through_all_entries() {
+        let entries: Vec<(&[u8], &[u8])> = vec![
+            (b"a", b"1"),
+            (b"b", b"2"),
+            (b"c", b"3"),
+            (b"d", b"4"),
+            (b"e", b"5"),
+        ];
+        let data = build_block(&entries, 2);
+        let reader = BlockReader::new(data).unwrap();
+        let mut iter = reader.iter();
+
+        // Walk forward to collect all keys.
+        iter.seek_to_first();
+        let mut forward_keys: Vec<Vec<u8>> = Vec::new();
+        while iter.valid() {
+            forward_keys.push(iter.key().to_vec());
+            iter.next();
+        }
+        assert_eq!(forward_keys.len(), 5);
+
+        // Walk backward from the last entry.
+        iter.seek_to_last();
+        let mut backward_keys: Vec<Vec<u8>> = Vec::new();
+        while iter.valid() {
+            backward_keys.push(iter.key().to_vec());
+            iter.prev();
+        }
+
+        // Reverse of backward should equal forward.
+        backward_keys.reverse();
+        assert_eq!(forward_keys, backward_keys);
+    }
+
+    #[test]
+    fn prev_at_first_entry_makes_invalid() {
+        let data = build_block(&[(b"aaa", b"1"), (b"bbb", b"2")], 16);
+        let reader = BlockReader::new(data).unwrap();
+        let mut iter = reader.iter();
+
+        iter.seek_to_first();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"aaa");
+
+        iter.prev();
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn prev_many_entries_with_prefix_compression() {
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..100u32)
+            .map(|i| {
+                (
+                    format!("shared-prefix-{:04}", i).into_bytes(),
+                    format!("val-{}", i).into_bytes(),
+                )
+            })
+            .collect();
+        let entry_refs: Vec<(&[u8], &[u8])> = entries
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+
+        let data = build_block(&entry_refs, 16);
+        let reader = BlockReader::new(data).unwrap();
+        let mut iter = reader.iter();
+
+        // Walk backward from the end.
+        iter.seek_to_last();
+        let mut backward: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        while iter.valid() {
+            backward.push((iter.key().to_vec(), iter.value().to_vec()));
+            iter.prev();
+        }
+
+        backward.reverse();
+        assert_eq!(backward.len(), entries.len());
+        for (i, (k, v)) in backward.iter().enumerate() {
+            assert_eq!(k, &entries[i].0, "key mismatch at index {}", i);
+            assert_eq!(v, &entries[i].1, "value mismatch at index {}", i);
+        }
+    }
+
+    #[test]
+    fn seek_to_last_on_empty_block() {
+        let mut builder = BlockBuilder::new(16);
+        let data = builder.finish().to_vec();
+        let reader = BlockReader::new(data).unwrap();
+        let mut iter = reader.iter();
+
+        iter.seek_to_last();
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn prev_after_seek_to_middle() {
+        let entries: Vec<(&[u8], &[u8])> = vec![
+            (b"a", b"1"),
+            (b"b", b"2"),
+            (b"c", b"3"),
+            (b"d", b"4"),
+            (b"e", b"5"),
+        ];
+        let data = build_block(&entries, 2);
+        let reader = BlockReader::new(data).unwrap();
+        let mut iter = reader.iter();
+
+        iter.seek(b"c");
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"c");
+
+        iter.prev();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"b");
+
+        iter.prev();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"a");
+
+        iter.prev();
         assert!(!iter.valid());
     }
 }

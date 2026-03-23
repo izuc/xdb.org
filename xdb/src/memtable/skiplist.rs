@@ -283,7 +283,7 @@ impl MemTable {
                 let value = unsafe { (*node).value.clone() };
                 Some(Ok(value))
             }
-            Some(ValueType::Deletion) => {
+            Some(ValueType::Deletion) | Some(ValueType::RangeDeletion) => {
                 Some(Err(error::Error::not_found(
                     String::from_utf8_lossy(lookup_user_key).to_string(),
                 )))

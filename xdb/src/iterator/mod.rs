@@ -44,4 +44,12 @@ pub trait XdbIterator {
     ///
     /// Panics (or produces undefined results) if `valid()` is `false`.
     fn value(&self) -> &[u8];
+
+    /// Position at the last entry (largest key).
+    /// Default: no-op (leaves iterator invalid).
+    fn seek_to_last(&mut self) {}
+
+    /// Move to the previous entry. Requires: `valid() == true`.
+    /// Default: no-op (leaves iterator invalid).
+    fn prev(&mut self) {}
 }

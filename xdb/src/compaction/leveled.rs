@@ -106,6 +106,30 @@ pub fn compact(
 ) -> Result<VersionEdit> {
     let mut edit = VersionEdit::new();
 
+    // Collect range tombstones from input files.
+    let mut range_tombstones: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new(); // (start, end, sequence)
+
+    for files in &state.input_files {
+        for file_meta in files {
+            let path = dbname.join(sst_file_name(file_meta.number));
+            let f = fs::File::open(&path)?;
+            let file_size = f.metadata()?.len();
+            let reader = TableReader::open(f, file_size, options.clone())?;
+            let entries = reader.iter_entries()?;
+            for (key, value) in &entries {
+                if let Some(parsed) = ParsedInternalKey::from_bytes(key) {
+                    if parsed.value_type == ValueType::RangeDeletion {
+                        range_tombstones.push((
+                            parsed.user_key.to_vec(),
+                            value.clone(),
+                            parsed.sequence,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     // Open all input files and create iterators.
     let mut iters: Vec<Box<dyn XdbIterator>> = Vec::new();
 
@@ -144,10 +168,35 @@ pub fn compact(
         }
         last_user_key = user_key.to_vec();
 
+        // Extract tag information for range tombstone and deletion checks.
+        let tag = extract_tag(key);
+        let seq = tag_sequence(tag);
+        let vt = tag_value_type(tag);
+
+        // Range tombstone entries themselves are passed through to output.
+        if vt == Some(ValueType::RangeDeletion) {
+            // Fall through to the add logic below.
+        } else {
+            // Check if this key is covered by a range tombstone.
+            let mut is_range_deleted = false;
+            for (start, end, tomb_seq) in &range_tombstones {
+                if user_key >= start.as_slice()
+                    && user_key < end.as_slice()
+                    && *tomb_seq >= seq
+                {
+                    is_range_deleted = true;
+                    break;
+                }
+            }
+            if is_range_deleted {
+                merger.next();
+                continue;
+            }
+        }
+
         // Drop deletion tombstones at the bottom level where no older files
         // could still reference the key.
-        let tag = extract_tag(key);
-        if let Some(ValueType::Deletion) = tag_value_type(tag) {
+        if let Some(ValueType::Deletion) = vt {
             if target_level == options.num_levels - 1 {
                 merger.next();
                 continue;

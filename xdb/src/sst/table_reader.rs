@@ -326,6 +326,33 @@ impl XdbIterator for TableIterator {
         debug_assert!(self.valid);
         &self.current_block_entries[self.entry_idx].1
     }
+
+    fn seek_to_last(&mut self) {
+        if self.index_entries.is_empty() {
+            self.valid = false;
+            return;
+        }
+        self.block_idx = self.index_entries.len() - 1;
+        self.load_current_block();
+        if self.valid {
+            self.entry_idx = self.current_block_entries.len() - 1;
+        }
+    }
+
+    fn prev(&mut self) {
+        assert!(self.valid, "prev() called on invalid TableIterator");
+        if self.entry_idx > 0 {
+            self.entry_idx -= 1;
+        } else if self.block_idx > 0 {
+            self.block_idx -= 1;
+            self.load_current_block();
+            if self.valid {
+                self.entry_idx = self.current_block_entries.len() - 1;
+            }
+        } else {
+            self.valid = false;
+        }
+    }
 }
 
 /// Read a block from an in-memory buffer, verifying its CRC32 checksum and
@@ -549,5 +576,94 @@ mod tests {
             Some((b"y".to_vec(), b"2".to_vec()))
         );
         assert_eq!(reader.get(b"w").unwrap(), None);
+    }
+
+    #[test]
+    fn table_iter_seek_to_last() {
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..100u32)
+            .map(|i| {
+                (
+                    format!("key-{:04}", i).into_bytes(),
+                    format!("val-{:04}", i).into_bytes(),
+                )
+            })
+            .collect();
+        let entry_refs: Vec<(&[u8], &[u8])> = entries
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+
+        let path = build_table(&entry_refs, default_options());
+        let file = std::fs::File::open(&path).unwrap();
+        let meta = file.metadata().unwrap();
+        let reader = TableReader::open(file, meta.len(), default_options()).unwrap();
+
+        let mut iter = reader.iter();
+        iter.seek_to_last();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"key-0099");
+        assert_eq!(iter.value(), b"val-0099");
+    }
+
+    #[test]
+    fn table_iter_prev_walks_backward() {
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..50u32)
+            .map(|i| {
+                (
+                    format!("key-{:04}", i).into_bytes(),
+                    format!("val-{:04}", i).into_bytes(),
+                )
+            })
+            .collect();
+        let entry_refs: Vec<(&[u8], &[u8])> = entries
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+
+        let path = build_table(&entry_refs, default_options());
+        let file = std::fs::File::open(&path).unwrap();
+        let meta = file.metadata().unwrap();
+        let reader = TableReader::open(file, meta.len(), default_options()).unwrap();
+
+        // Walk forward.
+        let mut iter = reader.iter();
+        iter.seek_to_first();
+        let mut forward_keys: Vec<Vec<u8>> = Vec::new();
+        while iter.valid() {
+            forward_keys.push(iter.key().to_vec());
+            iter.next();
+        }
+        assert_eq!(forward_keys.len(), 50);
+
+        // Walk backward.
+        let mut iter = reader.iter();
+        iter.seek_to_last();
+        let mut backward_keys: Vec<Vec<u8>> = Vec::new();
+        while iter.valid() {
+            backward_keys.push(iter.key().to_vec());
+            iter.prev();
+        }
+
+        backward_keys.reverse();
+        assert_eq!(forward_keys, backward_keys);
+    }
+
+    #[test]
+    fn table_iter_prev_at_first_entry() {
+        let path = build_table(
+            &[(b"aaa", b"1"), (b"bbb", b"2"), (b"ccc", b"3")],
+            default_options(),
+        );
+        let file = std::fs::File::open(&path).unwrap();
+        let meta = file.metadata().unwrap();
+        let reader = TableReader::open(file, meta.len(), default_options()).unwrap();
+
+        let mut iter = reader.iter();
+        iter.seek_to_first();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"aaa");
+
+        iter.prev();
+        assert!(!iter.valid());
     }
 }

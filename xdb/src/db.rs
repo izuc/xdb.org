@@ -206,6 +206,17 @@ impl Db {
         self.write(WriteOptions::default(), batch)
     }
 
+    /// Delete all keys in the range `[start_key, end_key)`.
+    ///
+    /// The start key is inclusive, the end key is exclusive. This writes a
+    /// range tombstone that efficiently covers the entire range without
+    /// needing to enumerate individual keys.
+    pub fn delete_range(&self, start_key: &[u8], end_key: &[u8]) -> Result<()> {
+        let mut batch = WriteBatch::new();
+        batch.delete_range(start_key, end_key);
+        self.write(WriteOptions::default(), batch)
+    }
+
     /// Read a value by key.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if self.shutting_down.load(AtomicOrdering::Acquire) {
@@ -459,8 +470,57 @@ impl Db {
             }
         }
 
+        // Collect range tombstones from all sources.
+        let mut range_tombstones = Vec::new();
+        Self::collect_range_tombstones_from_mem(&mem, sequence, &mut range_tombstones);
+        if let Some(ref imm) = imm {
+            Self::collect_range_tombstones_from_mem(imm, sequence, &mut range_tombstones);
+        }
+        for level in 0..version.num_levels {
+            for file_meta in version.files_at_level(level) {
+                if let Ok(reader) = self.table_cache.get_reader(
+                    file_meta.number,
+                    file_meta.file_size,
+                ) {
+                    if let Ok(entries) = reader.iter_entries() {
+                        for (k, v) in &entries {
+                            if let Some(p) = ParsedInternalKey::from_bytes(k) {
+                                if p.value_type == ValueType::RangeDeletion
+                                    && p.sequence <= sequence
+                                {
+                                    range_tombstones.push((
+                                        p.user_key.to_vec(),
+                                        v.clone(),
+                                        p.sequence,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let merger = MergingIterator::new(children);
-        DbIterator::new(Box::new(merger), sequence)
+        DbIterator::with_range_tombstones(Box::new(merger), sequence, range_tombstones)
+    }
+
+    /// Collect range tombstones from a memtable.
+    fn collect_range_tombstones_from_mem(
+        mem: &MemTable,
+        sequence: SequenceNumber,
+        out: &mut Vec<(Vec<u8>, Vec<u8>, SequenceNumber)>,
+    ) {
+        let mut iter = mem.iter();
+        iter.seek_to_first();
+        while iter.valid() {
+            if let Some(p) = ParsedInternalKey::from_bytes(iter.key()) {
+                if p.value_type == ValueType::RangeDeletion && p.sequence <= sequence {
+                    out.push((p.user_key.to_vec(), iter.value().to_vec(), p.sequence));
+                }
+            }
+            iter.next();
+        }
     }
 
     /// Collect all entries from a memtable into a Vec for use in iterators.
@@ -586,7 +646,7 @@ impl Db {
                             Statistics::record(&self.stats.bytes_read, value.len() as u64);
                             return Ok(SearchResult::Found(value));
                         }
-                        ValueType::Deletion => {
+                        ValueType::Deletion | ValueType::RangeDeletion => {
                             return Ok(SearchResult::Deleted);
                         }
                     }
@@ -830,6 +890,32 @@ impl Db {
                         mem.add(seq, ValueType::Deletion, key, b"");
                         seq += 1;
                     }
+                    Some(ValueType::RangeDeletion) => {
+                        // Range deletion: start_key + end_key
+                        let (start_len, n) = decode_varint32(&data[pos..])
+                            .ok_or_else(|| Error::corruption("truncated start key len in WAL range delete"))?;
+                        pos += n;
+                        let start_len = start_len as usize;
+                        if pos + start_len > data.len() {
+                            return Err(Error::corruption("truncated start key in WAL range delete"));
+                        }
+                        let start_key = &data[pos..pos + start_len];
+                        pos += start_len;
+
+                        let (end_len, n) = decode_varint32(&data[pos..])
+                            .ok_or_else(|| Error::corruption("truncated end key len in WAL range delete"))?;
+                        pos += n;
+                        let end_len = end_len as usize;
+                        if pos + end_len > data.len() {
+                            return Err(Error::corruption("truncated end key in WAL range delete"));
+                        }
+                        let end_key = &data[pos..pos + end_len];
+                        pos += end_len;
+
+                        // Store the range tombstone: start_key is the key, end_key is the value.
+                        mem.add(seq, ValueType::RangeDeletion, start_key, end_key);
+                        seq += 1;
+                    }
                     None => {
                         return Err(Error::corruption(format!(
                             "unknown value type {} in WAL batch",
@@ -882,6 +968,12 @@ impl<'a> WriteBatchHandler for MemTableInserter<'a> {
         self.mem.add(self.sequence, ValueType::Deletion, key, b"");
         self.sequence += 1;
     }
+
+    fn delete_range(&mut self, start_key: &[u8], end_key: &[u8]) {
+        self.mem
+            .add(self.sequence, ValueType::RangeDeletion, start_key, end_key);
+        self.sequence += 1;
+    }
 }
 
 /// Simple vector-based iterator for memtable snapshots.
@@ -918,5 +1010,19 @@ impl XdbIterator for VecIterator {
     }
     fn value(&self) -> &[u8] {
         &self.entries[self.pos].1
+    }
+    fn seek_to_last(&mut self) {
+        if self.entries.is_empty() {
+            self.pos = 0;
+        } else {
+            self.pos = self.entries.len() - 1;
+        }
+    }
+    fn prev(&mut self) {
+        if self.pos > 0 {
+            self.pos -= 1;
+        } else {
+            self.pos = self.entries.len(); // invalidate
+        }
     }
 }
