@@ -1,5 +1,5 @@
 # Rust build artifacts
-/xdb/target/
+**/target/
 **/*.rs.bk
 *.pdb
 

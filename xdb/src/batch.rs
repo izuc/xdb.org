@@ -168,6 +168,19 @@ impl WriteBatch {
         Ok(())
     }
 
+    /// Create a `WriteBatch` from raw data (header + records).
+    ///
+    /// The count is parsed from the header bytes 8..12. This is useful for
+    /// reconstructing a batch from a serialised copy (e.g. Python bindings).
+    pub fn from_data(data: Vec<u8>) -> Self {
+        let count = if data.len() >= 12 {
+            u32::from_le_bytes(data[8..12].try_into().unwrap())
+        } else {
+            0
+        };
+        WriteBatch { data, count }
+    }
+
     /// Approximate in-memory size of this batch in bytes.
     pub fn approximate_size(&self) -> usize {
         self.data.len()

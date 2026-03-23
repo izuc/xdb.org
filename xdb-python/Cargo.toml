@@ -1,0 +1,13 @@
+[package]
+name = "xdb-python"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for xdb embedded key-value store"
+
+[lib]
+name = "xdb"
+crate-type = ["cdylib"]
+
+[dependencies]
+xdb-core = { package = "xdb", path = "../xdb" }
+pyo3 = { version = "0.23", features = ["extension-module"] }

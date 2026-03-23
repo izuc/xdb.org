@@ -1,0 +1,11 @@
+[package]
+name = "xdb-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "C FFI bindings for xdb embedded key-value store"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+xdb = { path = "../xdb" }
