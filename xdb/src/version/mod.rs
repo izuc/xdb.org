@@ -400,11 +400,18 @@ impl VersionSet {
 
     /// Atomically update the CURRENT file to point to the given MANIFEST.
     fn set_current_file(&self, manifest_name: &str) -> Result<()> {
+        use std::io::Write;
+
         let current_path = self.dbname.join(CURRENT_FILE_NAME);
         let tmp_path = self.dbname.join("CURRENT.tmp");
 
-        // Write to a temp file, then rename for atomicity.
-        fs::write(&tmp_path, format!("{}\n", manifest_name))?;
+        // Write to a temp file, fsync it, then rename for atomicity.
+        // The fsync ensures the data is on disk before the rename makes
+        // it visible, preventing a crash from leaving a corrupt CURRENT.
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(format!("{}\n", manifest_name).as_bytes())?;
+        file.sync_all()?;
+        drop(file);
         fs::rename(&tmp_path, &current_path)?;
         Ok(())
     }

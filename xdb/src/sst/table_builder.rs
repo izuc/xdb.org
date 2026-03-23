@@ -151,6 +151,9 @@ impl TableBuilder {
         self.offset += FOOTER_SIZE as u64;
 
         self.writer.flush()?;
+        // Fsync the SST file to ensure data is durable on disk before the
+        // MANIFEST is updated to reference it.
+        self.writer.get_ref().sync_all()?;
         self.closed = true;
 
         Ok(self.offset)
