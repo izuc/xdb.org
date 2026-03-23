@@ -117,10 +117,6 @@ impl WriteBatch {
         let mut found = 0u32;
 
         while pos < self.data.len() {
-            if pos >= self.data.len() {
-                return Err(error::Error::corruption("batch record truncated"));
-            }
-
             let tag = self.data[pos];
             pos += 1;
 
@@ -134,17 +130,29 @@ impl WriteBatch {
                     handler.delete(key);
                 }
                 Some(ValueType::RangeDeletion) => {
-                    // Range deletion: start_key + end_key
+                    // Range deletion: start_key + end_key (with bounds checks)
                     let (start_len, n) = decode_varint32(&self.data[pos..])
                         .ok_or_else(|| error::Error::corruption("truncated varint in batch"))?;
                     pos += n;
-                    let start_key = &self.data[pos..pos + start_len as usize];
-                    pos += start_len as usize;
+                    let start_len = start_len as usize;
+                    if pos + start_len > self.data.len() {
+                        return Err(error::Error::corruption(
+                            "truncated start_key in range deletion",
+                        ));
+                    }
+                    let start_key = &self.data[pos..pos + start_len];
+                    pos += start_len;
                     let (end_len, n) = decode_varint32(&self.data[pos..])
                         .ok_or_else(|| error::Error::corruption("truncated varint in batch"))?;
                     pos += n;
-                    let end_key = &self.data[pos..pos + end_len as usize];
-                    pos += end_len as usize;
+                    let end_len = end_len as usize;
+                    if pos + end_len > self.data.len() {
+                        return Err(error::Error::corruption(
+                            "truncated end_key in range deletion",
+                        ));
+                    }
+                    let end_key = &self.data[pos..pos + end_len];
+                    pos += end_len;
                     handler.delete_range(start_key, end_key);
                 }
                 None => {

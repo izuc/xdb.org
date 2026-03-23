@@ -269,8 +269,8 @@ pub fn decode_varint32(data: &[u8]) -> Option<(u32, usize)> {
     let mut result: u32 = 0;
     let mut shift: u32 = 0;
     for (i, &byte) in data.iter().enumerate() {
-        if shift > 28 {
-            return None; // overflow
+        if i >= 5 {
+            return None; // varint32 uses at most 5 bytes
         }
         result |= ((byte & 0x7F) as u32) << shift;
         if byte & 0x80 == 0 {

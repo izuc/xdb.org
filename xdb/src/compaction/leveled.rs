@@ -194,9 +194,9 @@ pub fn compact(
             }
         }
 
-        // Drop deletion tombstones at the bottom level where no older files
-        // could still reference the key.
-        if let Some(ValueType::Deletion) = vt {
+        // Drop deletion and range-deletion tombstones at the bottom level
+        // where no older files could still reference the key.
+        if matches!(vt, Some(ValueType::Deletion) | Some(ValueType::RangeDeletion)) {
             if target_level == options.num_levels - 1 {
                 merger.next();
                 continue;

@@ -310,6 +310,11 @@ impl Db {
             return Err(Error::ShutdownInProgress);
         }
 
+        // Empty batches are a no-op — don't write to WAL or touch sequence numbers.
+        if batch.count() == 0 {
+            return Ok(());
+        }
+
         let mut state = self.state.lock();
         self.make_room_for_write(&mut state)?;
 
@@ -701,8 +706,13 @@ impl Db {
                             break;
                         }
                         // Pre-allocate file numbers for compaction output.
+                        // Estimate: one output file per input file, plus some headroom.
+                        let input_count: usize = comp.input_files.iter()
+                            .map(|f| f.len())
+                            .sum();
+                        let prealloc = (input_count + 10).max(20);
                         let next_file = state.versions.new_file_number();
-                        for _ in 0..20 {
+                        for _ in 0..prealloc {
                             let _ = state.versions.new_file_number();
                         }
                         Some((comp, next_file))

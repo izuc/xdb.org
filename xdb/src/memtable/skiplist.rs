@@ -7,8 +7,8 @@
 
 use crate::error;
 use crate::types::{
-    compare_internal_key, extract_tag, extract_user_key, tag_value_type, InternalKey, LookupKey,
-    SequenceNumber, ValueType,
+    compare_internal_key, extract_tag, extract_user_key, tag_sequence, tag_value_type, InternalKey,
+    LookupKey, SequenceNumber, ValueType,
 };
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -274,10 +274,43 @@ impl MemTable {
             return None;
         }
 
-        // The user keys match. Because internal key ordering places newer
-        // sequence numbers first, this is the most-recent version <= the
-        // requested sequence number.
+        // The user keys match. Verify the sequence number is <= the requested
+        // snapshot sequence (internal key ordering places newer sequences first,
+        // but find_greater_or_equal may land on a version newer than our snapshot).
         let tag = extract_tag(node_key);
+        let node_seq = tag_sequence(tag);
+        let lookup_seq = tag_sequence(extract_tag(lookup_key.internal_key()));
+        if node_seq > lookup_seq {
+            // The entry is newer than our snapshot. Walk forward to find an
+            // older version, or determine the key doesn't exist at this snapshot.
+            let mut cur = unsafe { (&(*node).next)[0].load(Ordering::Acquire) };
+            while !cur.is_null() {
+                let cur_key = unsafe { &(*cur).key };
+                let cur_user = extract_user_key(cur_key);
+                if cur_user != lookup_user_key {
+                    return None; // no version at this snapshot
+                }
+                let cur_tag = extract_tag(cur_key);
+                if tag_sequence(cur_tag) <= lookup_seq {
+                    // Found a version within our snapshot.
+                    return match tag_value_type(cur_tag) {
+                        Some(ValueType::Value) => {
+                            let value = unsafe { (*cur).value.clone() };
+                            Some(Ok(value))
+                        }
+                        Some(ValueType::Deletion) | Some(ValueType::RangeDeletion) => {
+                            Some(Err(error::Error::not_found(
+                                String::from_utf8_lossy(lookup_user_key).to_string(),
+                            )))
+                        }
+                        None => None,
+                    };
+                }
+                cur = unsafe { (&(*cur).next)[0].load(Ordering::Acquire) };
+            }
+            return None;
+        }
+
         match tag_value_type(tag) {
             Some(ValueType::Value) => {
                 let value = unsafe { (*node).value.clone() };

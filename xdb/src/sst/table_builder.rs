@@ -67,6 +67,9 @@ impl TableBuilder {
     /// Add a key-value pair. Keys **must** be added in sorted order.
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         assert!(!self.closed, "add() called after finish()");
+        // Note: keys must be added in sorted order. For internal keys this
+        // means compare_internal_key ordering; for raw keys it means bytewise.
+        // We don't assert here because the caller is responsible for ordering.
 
         // If a previous data block was flushed, write an index entry for it.
         if let Some(handle) = self.pending_handle.take() {
