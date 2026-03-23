@@ -761,15 +761,23 @@ impl Db {
             Statistics::record(&self.stats.compactions, 1);
 
             // Step 3: Apply the edit under lock.
-            {
+            let apply_result = {
                 let mut state = self.state.lock();
                 while state.versions.manifest_file_number() < next_file {
                     state.versions.new_file_number();
                 }
-                state.versions.log_and_apply(edit)?;
+                state.versions.log_and_apply(edit)
+            };
+
+            if let Err(e) = apply_result {
+                // Clean up orphaned compaction output files.
+                for f in &comp_state.output_files {
+                    let _ = fs::remove_file(self.dbname.join(sst_file_name(f.number)));
+                }
+                return Err(e);
             }
 
-            // Step 4: Cleanup outside lock.
+            // Step 4: Cleanup input files outside lock.
             for files in &comp_state.input_files {
                 for f in files {
                     self.table_cache.evict(f.number);
