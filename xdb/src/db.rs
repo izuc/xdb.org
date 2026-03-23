@@ -419,6 +419,11 @@ impl Db {
         // Signal background thread to stop.
         let _ = self.bg_sender.send(BgWork::Shutdown);
 
+        // Wait for the background thread to finish (with a timeout to avoid hangs).
+        if let Some(handle) = self._bg_handle.lock().take() {
+            let _ = handle.join();
+        }
+
         let mut state = self.state.lock();
         if !state.mem.is_empty() {
             let old_mem = std::mem::replace(&mut state.mem, Arc::new(MemTable::new()));
@@ -475,7 +480,8 @@ impl Db {
             }
         }
 
-        // Collect range tombstones from all sources.
+        // Collect range tombstones from memtables and SST files.
+        // Uses streaming iterators to avoid loading all entries into memory.
         let mut range_tombstones = Vec::new();
         Self::collect_range_tombstones_from_mem(&mem, sequence, &mut range_tombstones);
         if let Some(ref imm) = imm {
@@ -487,20 +493,22 @@ impl Db {
                     file_meta.number,
                     file_meta.file_size,
                 ) {
-                    if let Ok(entries) = reader.iter_entries() {
-                        for (k, v) in &entries {
-                            if let Some(p) = ParsedInternalKey::from_bytes(k) {
-                                if p.value_type == ValueType::RangeDeletion
-                                    && p.sequence <= sequence
-                                {
-                                    range_tombstones.push((
-                                        p.user_key.to_vec(),
-                                        v.clone(),
-                                        p.sequence,
-                                    ));
-                                }
+                    // Use the streaming iterator instead of loading all entries.
+                    let mut table_iter = reader.iter();
+                    table_iter.seek_to_first();
+                    while table_iter.valid() {
+                        if let Some(p) = ParsedInternalKey::from_bytes(table_iter.key()) {
+                            if p.value_type == ValueType::RangeDeletion
+                                && p.sequence <= sequence
+                            {
+                                range_tombstones.push((
+                                    p.user_key.to_vec(),
+                                    table_iter.value().to_vec(),
+                                    p.sequence,
+                                ));
                             }
                         }
+                        table_iter.next();
                     }
                 }
             }
@@ -608,7 +616,11 @@ impl Db {
             let mut edit = VersionEdit::new();
             edit.set_log_number(state.versions.log_number());
             edit.add_file(0, meta);
-            state.versions.log_and_apply(edit)?;
+            if let Err(e) = state.versions.log_and_apply(edit) {
+                // Clean up the orphaned SST file.
+                let _ = fs::remove_file(&sst_path);
+                return Err(e);
+            }
         } else {
             let _ = fs::remove_file(&sst_path);
         }
@@ -935,7 +947,10 @@ impl Db {
                 }
             }
 
-            let end_seq = sequence + count as u64;
+            // Use the actual number of operations parsed (seq - sequence),
+            // not the batch header count, in case the batch was truncated.
+            let actual_count = seq - sequence;
+            let end_seq = sequence + actual_count;
             if end_seq > *max_sequence {
                 *max_sequence = end_seq;
             }

@@ -223,6 +223,13 @@ impl VersionSet {
         if manifest_name.is_empty() {
             return Err(Error::corruption("empty CURRENT file"));
         }
+        // Validate the CURRENT file contains a single valid MANIFEST name.
+        if !manifest_name.starts_with("MANIFEST-") || manifest_name.contains('\n') {
+            return Err(Error::corruption(format!(
+                "invalid CURRENT file content: {:?}",
+                manifest_name
+            )));
+        }
 
         let manifest_path = self.dbname.join(manifest_name);
         if !manifest_path.exists() {
