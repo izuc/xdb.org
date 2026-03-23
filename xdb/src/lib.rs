@@ -33,6 +33,10 @@ pub mod sst;
 pub mod cache;
 pub mod iterator;
 pub mod version;
+pub mod table_cache;
+pub mod snapshot;
+pub mod db_iter;
+pub mod stats;
 pub mod compaction;
 pub mod db;
 
@@ -41,3 +45,6 @@ pub use db::Db;
 pub use error::{Error, Result};
 pub use options::{Options, ReadOptions, WriteOptions};
 pub use batch::WriteBatch;
+pub use snapshot::Snapshot;
+pub use db_iter::DbIterator;
+pub use stats::Statistics;

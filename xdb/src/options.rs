@@ -10,7 +10,12 @@
 pub enum CompressionType {
     /// No compression (fastest writes/reads, largest files).
     None,
-    // Future: Lz4, Zstd — behind feature flags.
+    /// LZ4 compression (fast, moderate ratio).
+    #[cfg(feature = "lz4")]
+    Lz4,
+    /// Zstandard compression (slower, better ratio).
+    #[cfg(feature = "zstd")]
+    Zstd,
 }
 
 impl Default for CompressionType {
@@ -83,6 +88,9 @@ pub struct Options {
     /// Block cache capacity in bytes.  0 disables the cache.  Default: 8 MiB.
     pub block_cache_capacity: usize,
 
+    /// Maximum number of open SST files kept in the table cache.  Default: 1000.
+    pub max_open_files: usize,
+
     // -- background work -----------------------------------------------------
     /// Maximum concurrent background compactions.  Default: 1.
     pub max_background_compactions: usize,
@@ -118,6 +126,7 @@ impl Default for Options {
             compression: CompressionType::None,
 
             block_cache_capacity: 8 * 1024 * 1024,
+            max_open_files: 1000,
 
             max_background_compactions: 1,
             max_background_flushes: 1,
@@ -161,6 +170,18 @@ impl Options {
     /// Builder-style: set sync_writes.
     pub fn sync_writes(mut self, v: bool) -> Self {
         self.sync_writes = v;
+        self
+    }
+
+    /// Builder-style: set compression type for data blocks.
+    pub fn compression(mut self, c: CompressionType) -> Self {
+        self.compression = c;
+        self
+    }
+
+    /// Builder-style: set maximum number of open SST files in the table cache.
+    pub fn max_open_files(mut self, n: usize) -> Self {
+        self.max_open_files = n;
         self
     }
 

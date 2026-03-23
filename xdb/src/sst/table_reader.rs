@@ -6,11 +6,14 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::iterator::XdbIterator;
 use crate::options::Options;
 use crate::sst::block::BlockReader;
 use crate::sst::bloom::BloomFilter;
+use crate::sst::compression;
 use crate::sst::footer::{BlockHandle, Footer, FOOTER_SIZE};
 
 /// Size of the block trailer on disk (compression_type: u8 + checksum: u32 LE).
@@ -156,12 +159,180 @@ impl TableReader {
 
         Ok(entries)
     }
+
+    /// Create a streaming iterator over all entries in this table.
+    ///
+    /// Unlike [`iter_entries`](Self::iter_entries), this loads blocks lazily
+    /// one at a time. The returned [`TableIterator`] implements
+    /// [`XdbIterator`].
+    pub fn iter(&self) -> TableIterator {
+        // Pre-parse the index entries.
+        let mut index_entries = Vec::new();
+        let mut idx_iter = self.index_block.iter();
+        idx_iter.seek_to_first();
+        while idx_iter.valid() {
+            if let Some((handle, _)) = BlockHandle::decode(idx_iter.value()) {
+                index_entries.push((idx_iter.key().to_vec(), handle));
+            }
+            idx_iter.next();
+        }
+
+        TableIterator {
+            data: Arc::new(self.data.clone()),
+            index_entries,
+            block_idx: 0,
+            current_block_entries: Vec::new(),
+            entry_idx: 0,
+            valid: false,
+        }
+    }
 }
 
-/// Read a block from an in-memory buffer, verifying its CRC32 checksum.
+// ---------------------------------------------------------------------------
+// TableIterator
+// ---------------------------------------------------------------------------
+
+/// Streaming iterator over all entries in an SST table.
 ///
-/// `handle.offset` and `handle.size` describe the block data; the 5-byte
-/// trailer immediately follows.
+/// Owns the table data (shared via [`Arc`] for cheap cloning) and iterates
+/// block by block, loading each data block lazily.
+pub struct TableIterator {
+    /// Full file data (shared via Arc for cheap cloning).
+    data: Arc<Vec<u8>>,
+    /// Pre-parsed index entries: (key, BlockHandle) for each data block.
+    index_entries: Vec<(Vec<u8>, BlockHandle)>,
+    /// Current index into index_entries.
+    block_idx: usize,
+    /// Current data block entries (fully decoded for simplicity).
+    current_block_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Current position within current_block_entries.
+    entry_idx: usize,
+    /// Whether the iterator is valid.
+    valid: bool,
+}
+
+impl TableIterator {
+    /// Load the data block at `self.block_idx` into `current_block_entries`.
+    /// Sets `valid` to false if the block cannot be loaded.
+    fn load_current_block(&mut self) {
+        self.current_block_entries.clear();
+        self.entry_idx = 0;
+
+        if self.block_idx >= self.index_entries.len() {
+            self.valid = false;
+            return;
+        }
+
+        let handle = &self.index_entries[self.block_idx].1;
+        let block_data = match read_block_from_buf(&self.data, handle) {
+            Ok(d) => d,
+            Err(_) => {
+                self.valid = false;
+                return;
+            }
+        };
+        let block = match BlockReader::new(block_data) {
+            Ok(b) => b,
+            Err(_) => {
+                self.valid = false;
+                return;
+            }
+        };
+
+        let mut iter = block.iter();
+        iter.seek_to_first();
+        while iter.valid() {
+            self.current_block_entries
+                .push((iter.key().to_vec(), iter.value().to_vec()));
+            iter.next();
+        }
+
+        if self.current_block_entries.is_empty() {
+            self.valid = false;
+        } else {
+            self.valid = true;
+        }
+    }
+}
+
+impl XdbIterator for TableIterator {
+    fn valid(&self) -> bool {
+        self.valid
+    }
+
+    fn seek_to_first(&mut self) {
+        self.block_idx = 0;
+        self.load_current_block();
+    }
+
+    fn seek(&mut self, target: &[u8]) {
+        if self.index_entries.is_empty() {
+            self.valid = false;
+            return;
+        }
+
+        // Binary search: find the first index entry whose key >= target.
+        // Index keys are the last key of each data block, so the target
+        // could be in a block whose last key is >= target.
+        let mut lo = 0usize;
+        let mut hi = self.index_entries.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.index_entries[mid].0.as_slice() < target {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+
+        if lo >= self.index_entries.len() {
+            self.valid = false;
+            return;
+        }
+
+        self.block_idx = lo;
+        self.load_current_block();
+
+        // Linear search within the block for the first key >= target.
+        while self.valid {
+            if self.current_block_entries[self.entry_idx].0.as_slice() >= target {
+                return;
+            }
+            // Advance within block
+            self.entry_idx += 1;
+            if self.entry_idx >= self.current_block_entries.len() {
+                // Move to next block
+                self.block_idx += 1;
+                self.load_current_block();
+            }
+        }
+    }
+
+    fn next(&mut self) {
+        assert!(self.valid, "next() called on invalid TableIterator");
+        self.entry_idx += 1;
+        if self.entry_idx >= self.current_block_entries.len() {
+            self.block_idx += 1;
+            self.load_current_block();
+        }
+    }
+
+    fn key(&self) -> &[u8] {
+        debug_assert!(self.valid);
+        &self.current_block_entries[self.entry_idx].0
+    }
+
+    fn value(&self) -> &[u8] {
+        debug_assert!(self.valid);
+        &self.current_block_entries[self.entry_idx].1
+    }
+}
+
+/// Read a block from an in-memory buffer, verifying its CRC32 checksum and
+/// decompressing if necessary.
+///
+/// `handle.offset` and `handle.size` describe the (possibly compressed) block
+/// data on disk; the 5-byte trailer immediately follows.
 fn read_block_from_buf(buf: &[u8], handle: &BlockHandle) -> Result<Vec<u8>> {
     let offset = handle.offset as usize;
     let size = handle.size as usize;
@@ -182,7 +353,7 @@ fn read_block_from_buf(buf: &[u8], handle: &BlockHandle) -> Result<Vec<u8>> {
     let compression_type = trailer[0];
     let stored_checksum = u32::from_le_bytes(trailer[1..5].try_into().unwrap());
 
-    // Verify CRC32 (block_data + compression_type byte).
+    // Verify CRC32 (compressed_data + compression_type byte).
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(block_data);
     hasher.update(&[compression_type]);
@@ -195,14 +366,8 @@ fn read_block_from_buf(buf: &[u8], handle: &BlockHandle) -> Result<Vec<u8>> {
         )));
     }
 
-    if compression_type != 0 {
-        return Err(Error::Corruption(format!(
-            "unsupported compression type {} at offset {}",
-            compression_type, offset
-        )));
-    }
-
-    Ok(block_data.to_vec())
+    // Decompress the block data.
+    compression::decompress(block_data, compression_type)
 }
 
 #[cfg(test)]

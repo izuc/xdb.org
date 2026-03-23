@@ -44,20 +44,21 @@ xdb is a from-scratch Rust reimplementation of the core ideas behind
 [RocksDB](https://rocksdb.org/) — an LSM-tree-based key-value store originally
 built at Facebook on top of Google's LevelDB. Where RocksDB is ~415,000 lines
 of C++ with decades of accumulated features, xdb distils the essential engine
-into ~6,800 lines of idiomatic, safe Rust.
+into ~8,800 lines of idiomatic, safe Rust.
 
 ### Design Goals
 
 | Goal | How |
 |------|-----|
-| **Lightweight** | ~6.8K lines of Rust vs ~415K lines of C++. No transactions, blob DB, wide columns, or other advanced features that most users don't need. |
+| **Lightweight** | ~8.8K lines of Rust vs ~415K lines of C++. No transactions, blob DB, wide columns, or other advanced features that most users don't need. |
 | **Fast** | Zero-copy where possible, concurrent reads via atomic skip list, bloom filters to skip SST files, LRU block cache, efficient varint encoding. |
 | **Embeddable** | Pure Rust crate with `cargo add xdb`. No C/C++ toolchain, no FFI, no build.rs complexity. |
 | **Safe** | All public APIs are safe Rust. Unsafe code is limited to the skip list internals (atomic pointer manipulation) with a safe wrapper. |
 | **Correct** | CRC32 checksums on WAL records and SST blocks, crash-safe MANIFEST updates, WAL replay on recovery. |
 
-### What xdb Implements (Phase 1)
+### What xdb Implements
 
+**Phase 1 — Core Engine:**
 - Put, Get, Delete operations
 - Atomic WriteBatch (multiple operations in one atomic write)
 - Write-Ahead Log for crash durability
@@ -67,6 +68,14 @@ into ~6,800 lines of idiomatic, safe Rust.
 - MANIFEST-based version tracking with crash recovery
 - LRU block cache for repeated reads
 - Thread-safe `Arc<Db>` handle
+
+**Phase 2 — Production Hardening:**
+- Table cache (caches open SST readers to avoid re-opening files)
+- Snapshots / MVCC (point-in-time consistent reads)
+- Streaming DB iterator for range scans (`iter()`, `iter_with_snapshot()`)
+- Compression (LZ4 and Zstd via optional feature flags)
+- Background compaction (runs in a separate thread, releases lock during I/O)
+- Statistics counters (atomic, lock-free observability)
 
 ---
 
@@ -140,6 +149,29 @@ batch.put(b"key2", b"value2");
 batch.delete(b"key3");
 db.write(WriteOptions::default(), batch).unwrap();
 
+// Range scan via iterator.
+let mut iter = db.iter();
+iter.seek_to_first();
+while iter.valid() {
+    println!("{:?} => {:?}", iter.key(), iter.value());
+    iter.next();
+}
+
+// Snapshots for consistent reads.
+let snap = db.snapshot();
+db.put(b"key1", b"updated").unwrap();
+// Iterator at the snapshot still sees the OLD value:
+let mut snap_iter = db.iter_with_snapshot(&snap);
+snap_iter.seek(b"key1");
+
+// Compression (requires feature flag: --features lz4 or --features zstd).
+// let opts = Options::default()
+//     .create_if_missing(true)
+//     .compression(CompressionType::Lz4);
+
+// Statistics.
+println!("{}", db.stats());
+
 // Explicit flush to disk.
 db.flush().unwrap();
 
@@ -165,6 +197,11 @@ cheaply cloned and shared across threads.
 | `write` | `fn write(&self, opts: WriteOptions, batch: WriteBatch) -> Result<()>` | Apply a batch atomically. |
 | `flush` | `fn flush(&self) -> Result<()>` | Force the memtable to disk. |
 | `close` | `fn close(&self) -> Result<()>` | Graceful shutdown. |
+| `iter` | `fn iter(&self) -> DbIterator` | Forward iterator over all entries. |
+| `iter_with_snapshot` | `fn iter_with_snapshot(&self, snap: &Snapshot) -> DbIterator` | Iterator at a snapshot. |
+| `snapshot` | `fn snapshot(&self) -> Arc<Snapshot>` | Create a point-in-time snapshot. |
+| `release_snapshot` | `fn release_snapshot(&self, snap: &Snapshot)` | Release a snapshot. |
+| `stats` | `fn stats(&self) -> &Statistics` | Get live statistics counters. |
 
 ### `WriteBatch`
 
@@ -728,19 +765,23 @@ xdb/src/
 
 | Module | Lines | Purpose |
 |--------|-------|---------|
-| `db.rs` | 827 | Main coordinator |
-| `sst/` | 1,621 | SST file format |
+| `db.rs` | 922 | Main coordinator (table cache, snapshots, bg compaction) |
+| `sst/` | 1,810 | SST file format + compression + streaming iterators |
+| `version/` | 859 | Version management |
 | `memtable/` | 553 | SkipList memtable |
 | `types.rs` | 461 | Core types and encoding |
 | `cache/` | 449 | LRU block cache |
-| `version/` | 859 | Version management |
 | `wal/` | 503 | Write-ahead log |
 | `iterator/` | 411 | Iterator abstractions |
 | `batch.rs` | 349 | WriteBatch |
 | `compaction/` | 276 | Leveled compaction |
-| `options.rs` | 223 | Configuration |
-| Other | ~250 | error.rs, lib.rs, mod.rs files |
-| **Total** | **~6,800** | |
+| `options.rs` | 225 | Configuration |
+| `table_cache.rs` | 175 | SST reader cache |
+| `db_iter.rs` | 210 | User-facing DB iterator |
+| `snapshot.rs` | 135 | Snapshot management |
+| `stats.rs` | 145 | Atomic statistics counters |
+| Other | ~350 | error.rs, lib.rs, mod.rs files |
+| **Total** | **~8,400** | |
 
 ---
 
@@ -769,16 +810,7 @@ xdb covers the core 90% of functionality that most applications need, in
 
 ---
 
-## Future Work (Phase 2+)
-
-### Phase 2 — Production Hardening
-- **Compression**: LZ4 and Zstd support via feature flags
-- **Snapshots / MVCC**: Consistent point-in-time reads
-- **Column families**: Independent key spaces with separate compaction
-- **Background threads**: Asynchronous flush and compaction via thread pool
-- **Rate limiting**: Control background I/O bandwidth
-- **Statistics / metrics**: Per-operation counters and histograms
-- **Table cache**: Reuse TableReader across lookups (avoid re-opening files)
+## Future Work (Phase 3+)
 
 ### Phase 3 — Advanced Features
 - **Range deletes**: Efficient deletion of key ranges

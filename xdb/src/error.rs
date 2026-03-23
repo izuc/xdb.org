@@ -54,4 +54,8 @@ impl Error {
     pub fn internal(msg: impl Into<String>) -> Self {
         Error::Internal(msg.into())
     }
+
+    pub fn not_supported(msg: impl Into<String>) -> Self {
+        Error::NotSupported(msg.into())
+    }
 }

@@ -22,6 +22,7 @@ use crate::error::Result;
 use crate::options::Options;
 use crate::sst::block::BlockBuilder;
 use crate::sst::bloom::BloomFilter;
+use crate::sst::compression;
 use crate::sst::footer::{BlockHandle, Footer, FOOTER_SIZE};
 
 /// Size of the block trailer appended after every block on disk.
@@ -175,17 +176,24 @@ impl TableBuilder {
 
     /// Write a block (data bytes) plus its 5-byte trailer to the file.
     ///
+    /// The block data is compressed according to `self.options.compression`
+    /// before writing. The CRC32 covers the compressed data plus the
+    /// compression type byte.
+    ///
     /// Returns the [`BlockHandle`] pointing to the written block.
     fn write_block(&mut self, block_data: &[u8]) -> Result<BlockHandle> {
-        let handle = BlockHandle::new(self.offset, block_data.len() as u64);
+        // Compress the block data.
+        let compressed = compression::compress(block_data, self.options.compression)?;
 
-        // Write block data.
-        self.writer.write_all(block_data)?;
+        let handle = BlockHandle::new(self.offset, compressed.len() as u64);
 
-        // Compute CRC32 of block_data + compression_type byte.
-        let compression_type: u8 = 0; // None
+        // Write compressed block data.
+        self.writer.write_all(&compressed)?;
+
+        // Compute CRC32 of compressed_data + compression_type byte.
+        let compression_type = compression::compression_type_to_byte(self.options.compression);
         let mut hasher = crc32fast::Hasher::new();
-        hasher.update(block_data);
+        hasher.update(&compressed);
         hasher.update(&[compression_type]);
         let checksum = hasher.finalize();
 
@@ -193,7 +201,7 @@ impl TableBuilder {
         self.writer.write_all(&[compression_type])?;
         self.writer.write_all(&checksum.to_le_bytes())?;
 
-        self.offset += block_data.len() as u64 + BLOCK_TRAILER_SIZE as u64;
+        self.offset += compressed.len() as u64 + BLOCK_TRAILER_SIZE as u64;
 
         Ok(handle)
     }
