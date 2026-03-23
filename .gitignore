@@ -1,0 +1,22 @@
+# Rust build artifacts
+/xdb/target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# RocksDB reference source (not part of xdb)
+/rocksdb-main/
+
+# Claude memory (local only)
+.claude/
