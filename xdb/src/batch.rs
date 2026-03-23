@@ -180,12 +180,19 @@ impl WriteBatch {
     ///
     /// The count is parsed from the header bytes 8..12. This is useful for
     /// reconstructing a batch from a serialised copy (e.g. Python bindings).
+    /// Construct a `WriteBatch` from raw serialized data.
+    ///
+    /// The data must contain at least a 12-byte header (8-byte sequence +
+    /// 4-byte count). If shorter, the batch is treated as empty.
     pub fn from_data(data: Vec<u8>) -> Self {
-        let count = if data.len() >= 12 {
-            u32::from_le_bytes(data[8..12].try_into().unwrap())
-        } else {
-            0
-        };
+        if data.len() < HEADER_SIZE {
+            // Short data: return an empty but valid batch.
+            let mut batch = WriteBatch::new();
+            batch.data = data;
+            batch.count = 0;
+            return batch;
+        }
+        let count = u32::from_le_bytes(data[8..12].try_into().unwrap());
         WriteBatch { data, count }
     }
 

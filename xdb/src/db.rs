@@ -691,7 +691,9 @@ impl Db {
                 BgWork::Shutdown => break,
                 BgWork::MaybeCompact => {
                     if let Some(db) = weak.upgrade() {
-                        let _ = db.do_background_compaction();
+                        if let Err(e) = db.do_background_compaction() {
+                            log::error!("background compaction failed: {}", e);
+                        }
                     }
                 }
             }
@@ -702,7 +704,10 @@ impl Db {
     fn do_background_compaction(&self) -> Result<()> {
         use crate::compaction;
 
-        loop {
+        // Limit iterations to prevent infinite loops on corrupt metadata.
+        const MAX_COMPACTION_ROUNDS: usize = 32;
+
+        for _round in 0..MAX_COMPACTION_ROUNDS {
             // Step 1: Pick compaction under lock.
             let comp_info = {
                 let mut state = self.state.lock();

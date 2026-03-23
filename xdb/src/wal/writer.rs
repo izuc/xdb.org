@@ -68,6 +68,12 @@ impl WalWriter {
 
         // We must emit at least one physical record even for zero-length data.
         loop {
+            debug_assert!(
+                self.block_offset <= BLOCK_SIZE,
+                "WAL block_offset {} exceeds BLOCK_SIZE {}",
+                self.block_offset,
+                BLOCK_SIZE,
+            );
             let leftover = BLOCK_SIZE - self.block_offset;
 
             // If fewer than HEADER_SIZE bytes remain, pad with zeros.

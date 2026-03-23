@@ -213,7 +213,16 @@ impl BlockReader {
     /// Get the byte offset stored at the given restart index.
     fn restart_offset(&self, index: usize) -> usize {
         assert!((index as u32) < self.num_restarts);
-        let pos = self.restarts_offset + index * 4;
+        let pos = self
+            .restarts_offset
+            .checked_add(index.checked_mul(4).expect("restart index overflow"))
+            .expect("restart offset overflow");
+        assert!(
+            pos + 4 <= self.data.len(),
+            "restart offset out of bounds: {} + 4 > {}",
+            pos,
+            self.data.len()
+        );
         u32::from_le_bytes(self.data[pos..pos + 4].try_into().unwrap()) as usize
     }
 
