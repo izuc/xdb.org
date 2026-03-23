@@ -24,8 +24,8 @@ const BLOCK_TRAILER_SIZE: usize = 5;
 /// The entire file is read into memory on open. For Phase 1 this is acceptable
 /// because SST files are typically 2-64 MB.
 pub struct TableReader {
-    /// Complete file contents.
-    data: Vec<u8>,
+    /// Complete file contents (shared via Arc so iterators don't need to clone).
+    data: Arc<Vec<u8>>,
     /// Parsed index block.
     index_block: BlockReader,
     /// Raw bloom filter data (if present).
@@ -78,7 +78,7 @@ impl TableReader {
         };
 
         Ok(TableReader {
-            data,
+            data: Arc::new(data),
             index_block,
             filter_data,
             options,
@@ -178,7 +178,7 @@ impl TableReader {
         }
 
         TableIterator {
-            data: Arc::new(self.data.clone()),
+            data: Arc::clone(&self.data),
             index_entries,
             block_idx: 0,
             current_block_entries: Vec::new(),

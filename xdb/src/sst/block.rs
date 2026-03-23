@@ -471,6 +471,11 @@ impl<'a> BlockIterator<'a> {
         }
 
         // Rebuild the full key: keep `shared` bytes, append delta.
+        // Validate shared prefix length against the current key buffer.
+        if shared > self.key.len() {
+            self.valid = false;
+            return;
+        }
         self.key.truncate(shared);
         self.key
             .extend_from_slice(&data[header_len..header_len + non_shared]);
