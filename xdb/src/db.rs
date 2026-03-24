@@ -321,7 +321,7 @@ impl Db {
                     // Lazily check range tombstones only when a value is found.
                     if self.check_range_tombstones_for_found_key(
                         key, sequence, mem_has_tombstones, &mem, imm.as_deref(),
-                        &version, file_meta,
+                        &version,
                     )? {
                         return Ok(None);
                     }
@@ -350,7 +350,7 @@ impl Db {
                 SearchResult::Found(value) => {
                     if self.check_range_tombstones_for_found_key(
                         key, sequence, mem_has_tombstones, &mem, imm.as_deref(),
-                        &version, file_meta,
+                        &version,
                     )? {
                         return Ok(None);
                     }
@@ -364,9 +364,11 @@ impl Db {
         Ok(None)
     }
 
-    /// Check range tombstones lazily, only when a value has been found in an
-    /// SST file. If no memtable has tombstones AND the source file has no
-    /// cached tombstones, skip the expensive full scan entirely.
+    /// Check range tombstones lazily, only when a value has been found.
+    ///
+    /// Must check tombstones from ALL sources (memtable, imm, and ALL SST
+    /// files) because a newer L0 file may contain a range tombstone that
+    /// covers a value found in an older file.
     #[allow(clippy::too_many_arguments)]
     fn check_range_tombstones_for_found_key(
         &self,
@@ -376,21 +378,33 @@ impl Db {
         mem: &MemTable,
         imm: Option<&MemTable>,
         version: &Version,
-        source_file: &FileMetaData,
     ) -> Result<bool> {
-        // Fast path: check the source file's cached tombstones first.
-        let reader = self.table_cache.get_reader(
-            source_file.number,
-            source_file.file_size,
-        )?;
-        let source_has_tombstones = !reader.range_tombstones().is_empty();
-
-        if !mem_has_tombstones && !source_has_tombstones {
-            // Common case: no range deletes anywhere relevant. Skip.
-            return Ok(false);
+        // Fast path: if no memtable has tombstones, check whether ANY
+        // SST file has cached tombstones before doing the full scan.
+        if !mem_has_tombstones {
+            let mut any_sst_tombstones = false;
+            for level in 0..version.num_levels {
+                for file_meta in version.files_at_level(level) {
+                    if let Ok(reader) = self.table_cache.get_reader(
+                        file_meta.number,
+                        file_meta.file_size,
+                    ) {
+                        if !reader.range_tombstones().is_empty() {
+                            any_sst_tombstones = true;
+                            break;
+                        }
+                    }
+                }
+                if any_sst_tombstones {
+                    break;
+                }
+            }
+            if !any_sst_tombstones {
+                return Ok(false);
+            }
         }
 
-        // Slow path: some tombstones exist, do the full collection.
+        // Slow path: tombstones exist somewhere, do the full collection.
         let range_tombstones = self.collect_range_tombstones_for_get(
             user_key, mem, imm, version, sequence,
         );

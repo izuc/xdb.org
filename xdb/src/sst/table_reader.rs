@@ -518,7 +518,6 @@ fn read_block_from_buf(buf: &[u8], handle: &BlockHandle) -> Result<Vec<u8>> {
     let compression_type = trailer[0];
     let stored_checksum = u32::from_le_bytes(trailer[1..5].try_into().unwrap());
 
-    // Verify CRC32 (compressed_data + compression_type byte).
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(block_data);
     hasher.update(&[compression_type]);
@@ -531,9 +530,9 @@ fn read_block_from_buf(buf: &[u8], handle: &BlockHandle) -> Result<Vec<u8>> {
         )));
     }
 
-    // Decompress the block data.
     compression::decompress(block_data, compression_type)
 }
+
 
 #[cfg(test)]
 mod tests {

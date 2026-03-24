@@ -52,7 +52,7 @@ impl WalWriter {
     /// The file should be opened in write (and typically append) mode.
     pub fn new(file: File) -> Self {
         WalWriter {
-            writer: BufWriter::new(file),
+            writer: BufWriter::with_capacity(64 * 1024, file), // 64 KiB aligned to 2 WAL blocks
             block_offset: 0,
         }
     }
