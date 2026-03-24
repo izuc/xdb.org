@@ -31,7 +31,7 @@ use crate::stats::Statistics;
 use crate::table_cache::TableCache;
 use crate::types::*;
 use crate::version::edit::{FileMetaData, VersionEdit};
-use crate::version::VersionSet;
+use crate::version::{Version, VersionSet};
 use crate::wal::WalWriter;
 
 use crossbeam_channel::Sender;
@@ -252,13 +252,23 @@ impl Db {
 
         let lookup = LookupKey::new(key, sequence);
 
+        // Collect range tombstones from all sources so point lookups
+        // correctly return None for keys covered by delete_range().
+        let range_tombstones = self.collect_range_tombstones_for_get(
+            key, &mem, imm.as_deref(), &version, sequence,
+        );
+
         // 1. Active memtable.
         if let Some(result) = mem.get(&lookup) {
             Statistics::record(&self.stats.memtable_hits, 1);
             return match result {
                 Ok(value) => {
-                    Statistics::record(&self.stats.bytes_read, value.len() as u64);
-                    Ok(Some(value))
+                    if Self::is_key_range_deleted(key, sequence, &range_tombstones) {
+                        Ok(None)
+                    } else {
+                        Statistics::record(&self.stats.bytes_read, value.len() as u64);
+                        Ok(Some(value))
+                    }
                 }
                 Err(Error::NotFound(_)) => Ok(None),
                 Err(e) => Err(e),
@@ -271,8 +281,12 @@ impl Db {
                 Statistics::record(&self.stats.memtable_hits, 1);
                 return match result {
                     Ok(value) => {
-                        Statistics::record(&self.stats.bytes_read, value.len() as u64);
-                        Ok(Some(value))
+                        if Self::is_key_range_deleted(key, sequence, &range_tombstones) {
+                            Ok(None)
+                        } else {
+                            Statistics::record(&self.stats.bytes_read, value.len() as u64);
+                            Ok(Some(value))
+                        }
                     }
                     Err(Error::NotFound(_)) => Ok(None),
                     Err(e) => Err(e),
@@ -290,7 +304,12 @@ impl Db {
                 continue;
             }
             match self.search_sst_file(file_meta, key, sequence)? {
-                SearchResult::Found(value) => return Ok(Some(value)),
+                SearchResult::Found(value) => {
+                    if Self::is_key_range_deleted(key, sequence, &range_tombstones) {
+                        return Ok(None);
+                    }
+                    return Ok(Some(value));
+                }
                 SearchResult::Deleted => return Ok(None),
                 SearchResult::NotFound => continue,
             }
@@ -311,7 +330,12 @@ impl Db {
                 continue;
             }
             match self.search_sst_file(file_meta, key, sequence)? {
-                SearchResult::Found(value) => return Ok(Some(value)),
+                SearchResult::Found(value) => {
+                    if Self::is_key_range_deleted(key, sequence, &range_tombstones) {
+                        return Ok(None);
+                    }
+                    return Ok(Some(value));
+                }
                 SearchResult::Deleted => return Ok(None),
                 SearchResult::NotFound => continue,
             }
@@ -543,6 +567,89 @@ impl Db {
             }
             iter.next();
         }
+    }
+
+    /// Collect range tombstones relevant to a point lookup for a specific key.
+    ///
+    /// Only collects tombstones whose range covers `user_key`, avoiding a
+    /// full scan when no tombstones exist near the target.
+    fn collect_range_tombstones_for_get(
+        &self,
+        user_key: &[u8],
+        mem: &MemTable,
+        imm: Option<&MemTable>,
+        version: &Version,
+        sequence: SequenceNumber,
+    ) -> Vec<(Vec<u8>, Vec<u8>, SequenceNumber)> {
+        let mut tombstones = Vec::new();
+
+        // Memtable range tombstones.
+        Self::collect_range_tombstones_from_mem(mem, sequence, &mut tombstones);
+        if let Some(imm) = imm {
+            Self::collect_range_tombstones_from_mem(imm, sequence, &mut tombstones);
+        }
+
+        // SST file range tombstones — only scan files whose key range
+        // could contain a tombstone covering user_key.
+        for level in 0..version.num_levels {
+            for file_meta in version.files_at_level(level) {
+                // Quick skip: if the file's key range doesn't overlap user_key,
+                // it can't have a relevant range tombstone whose start <= user_key.
+                if file_meta.smallest_key.user_key() > user_key {
+                    continue;
+                }
+                if let Ok(reader) = self.table_cache.get_reader(
+                    file_meta.number,
+                    file_meta.file_size,
+                ) {
+                    let mut scan = reader.iter();
+                    scan.seek_to_first();
+                    while scan.valid() {
+                        if let Some(p) = ParsedInternalKey::from_bytes(scan.key()) {
+                            if p.value_type == ValueType::RangeDeletion
+                                && p.sequence <= sequence
+                                && p.user_key <= user_key
+                            {
+                                let end = scan.value();
+                                if user_key < end {
+                                    tombstones.push((
+                                        p.user_key.to_vec(),
+                                        end.to_vec(),
+                                        p.sequence,
+                                    ));
+                                }
+                            }
+                            // Range tombstone start keys are user keys.
+                            // If start > user_key, no further tombstones
+                            // in this file can cover user_key.
+                            if p.user_key > user_key {
+                                break;
+                            }
+                        }
+                        scan.next();
+                    }
+                }
+            }
+        }
+
+        tombstones
+    }
+
+    /// Check whether a user key is covered by any collected range tombstone.
+    fn is_key_range_deleted(
+        user_key: &[u8],
+        sequence: SequenceNumber,
+        tombstones: &[(Vec<u8>, Vec<u8>, SequenceNumber)],
+    ) -> bool {
+        for (start, end, tomb_seq) in tombstones {
+            if user_key >= start.as_slice()
+                && user_key < end.as_slice()
+                && *tomb_seq <= sequence
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Collect all entries from a memtable into a Vec for use in iterators.
