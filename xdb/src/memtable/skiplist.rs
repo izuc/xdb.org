@@ -33,6 +33,7 @@ const BRANCHING_FACTOR: u32 = 4;
 struct Node {
     key: Vec<u8>,
     value: Vec<u8>,
+    #[allow(dead_code)] // Tracked per-node for structural clarity; actual height read from SkipList::max_height
     height: usize,
     next: [AtomicPtr<Node>; MAX_HEIGHT],
 }
@@ -495,9 +496,10 @@ impl crate::iterator::XdbIterator for OwnedMemTableIterator {
     }
 
     fn seek(&mut self, target: &[u8]) {
-        // Walk the skiplist from head to find the first node >= target.
+        // Walk the skiplist from head using the actual current height
+        // (not MAX_HEIGHT) to avoid traversing empty upper levels.
         let mut current = self.head;
-        let mut level = unsafe { (*self.head).height } - 1;
+        let mut level = self._mem.list.current_height() - 1;
         loop {
             let next = unsafe { Node::get_next(current, level) };
             if !next.is_null()
