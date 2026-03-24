@@ -168,12 +168,14 @@ cargo bench -p xdb --bench comparison      # xdb vs RocksDB
 | `db.delete(key)` | Delete a key |
 | `db.delete_range(start, end)` | Delete all keys in [start, end) |
 | `db.write(opts, batch)` | Apply a WriteBatch atomically |
+| `db.exists(key)` | Exact key existence check |
 | `db.key_may_exist(key)` | Bloom-filter existence check (no value read) |
 | `db.flush()` | Force the memtable to disk |
 | `db.compact_range(start, end)` | Manually compact a key range |
 | `db.close()` | Graceful shutdown with sync |
 | `db.iter()` | Forward/backward iterator |
 | `db.iter_with_snapshot(snap)` | Iterator at a snapshot |
+| `db.prefix_iterator(prefix)` | Iterator scanning keys with given prefix |
 | `db.snapshot()` | Create a point-in-time snapshot |
 | `db.release_snapshot(snap)` | Release a snapshot |
 | `db.get_property(name)` | Query internal stats by name |
@@ -182,7 +184,7 @@ cargo bench -p xdb --bench comparison      # xdb vs RocksDB
 | `Db::repair(opts, path)` | Rebuild MANIFEST from valid SST files |
 
 **Iterator methods:** `seek_to_first()`, `seek_to_last()`, `seek(target)`,
-`next()`, `prev()`, `key()`, `value()`, `valid()`,
+`seek_for_prev(target)`, `next()`, `prev()`, `key()`, `value()`, `valid()`,
 `set_upper_bound(key)`, `set_lower_bound(key)`.
 
 **WriteOptions:** `sync` (fsync WAL), `disable_wal` (skip WAL for ephemeral data).

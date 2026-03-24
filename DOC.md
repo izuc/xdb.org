@@ -35,8 +35,9 @@ embedded directly in any Rust application with zero FFI overhead.
 10. [Module Reference](#module-reference)
 11. [Operational Features](#operational-features)
 12. [Comparison with RocksDB](#comparison-with-rocksdb)
-13. [Known Limitations](#known-limitations)
-14. [Building and Testing](#building-and-testing)
+13. [ZIPP Blockchain Compatibility](#zipp-blockchain-compatibility)
+14. [Known Limitations](#known-limitations)
+15. [Building and Testing](#building-and-testing)
 
 ---
 
@@ -236,12 +237,14 @@ cheaply cloned and shared across threads.
 | `delete` | `fn delete(&self, key: &[u8]) -> Result<()>` | Delete a key (writes a tombstone). |
 | `delete_range` | `fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()>` | Delete all keys in `[start, end)`. |
 | `write` | `fn write(&self, opts: WriteOptions, batch: WriteBatch) -> Result<()>` | Apply a batch atomically. |
+| `exists` | `fn exists(&self, key: &[u8]) -> Result<bool>` | Exact key existence check. |
 | `key_may_exist` | `fn key_may_exist(&self, key: &[u8]) -> bool` | Bloom-filter existence check (no value read). |
 | `flush` | `fn flush(&self) -> Result<()>` | Force the memtable to disk. |
 | `compact_range` | `fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()>` | Manual compaction of a key range. |
 | `close` | `fn close(&self) -> Result<()>` | Graceful shutdown with sync. |
 | `iter` | `fn iter(&self) -> DbIterator` | Forward/backward iterator over all entries. |
 | `iter_with_snapshot` | `fn iter_with_snapshot(&self, snap: &Snapshot) -> DbIterator` | Iterator at a snapshot. |
+| `prefix_iterator` | `fn prefix_iterator(&self, prefix: &[u8]) -> DbIterator` | Iterator scanning keys with given prefix. |
 | `snapshot` | `fn snapshot(&self) -> Arc<Snapshot>` | Create a point-in-time snapshot. |
 | `release_snapshot` | `fn release_snapshot(&self, snap: &Snapshot)` | Release a snapshot. |
 | `get_property` | `fn get_property(&self, name: &str) -> Option<String>` | Query internal stats by name. |
@@ -329,6 +332,7 @@ let opts = Options::default()
 | `seek_to_first()` | Position at the first entry. |
 | `seek_to_last()` | Position at the last entry. |
 | `seek(target)` | Position at the first entry with key >= target. |
+| `seek_for_prev(target)` | Position at the last entry with key <= target. |
 | `next()` | Advance to the next entry. |
 | `prev()` | Move to the previous entry. |
 | `key()` / `value()` | Current entry's key and value. |
@@ -715,6 +719,33 @@ Data in corrupted SST files or WAL files that hadn't been flushed is lost. After
 use xdb::{Db, Options};
 Db::repair(Options::default(), "/path/to/broken_db").unwrap();
 ```
+
+---
+
+## ZIPP Blockchain Compatibility
+
+xdb provides all the storage primitives needed to serve as a RocksDB replacement
+for the ZIPP blockchain. ZIPP's `StorageBackend` trait maps to xdb as follows:
+
+| ZIPP `StorageBackend` method | xdb implementation |
+|------------------------------|-------------------|
+| `get(table, key)` | `db.get(table_key)` with prefixed key |
+| `put(table, key, value)` | `db.put(table_key, value)` with prefixed key |
+| `delete(table, key)` | `db.delete(table_key)` with prefixed key |
+| `exists(table, key)` | `db.exists(table_key)` |
+| `scan_prefix(table, prefix)` | `db.prefix_iterator(table_prefix)` |
+| `scan_prefix_limit(table, prefix, limit)` | `db.prefix_iterator(table_prefix)` + `.take(limit)` |
+| `scan_prefix_reverse_limit(table, prefix, limit)` | `seek_for_prev()` + `prev()` loop |
+| `batch_write(ops)` | `WriteBatch` with prefixed keys |
+
+**Column families → prefix namespacing:** ZIPP uses 30+ RocksDB column families
+for table isolation. Since xdb does not implement column families, the xdb
+backend uses prefix-based key namespacing: `table_name + \0 + actual_key`.
+This is the same approach ZIPP's in-memory backend uses, so the `StorageBackend`
+trait already supports it.
+
+**Key helper:** `prefix_successor(prefix)` computes the upper bound for prefix
+iteration, enabling efficient `scan_prefix` and `scan_prefix_reverse_limit`.
 
 ---
 

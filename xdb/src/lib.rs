@@ -43,7 +43,7 @@ pub mod backup;
 pub mod db;
 
 // Re-export the main public API at crate root.
-pub use db::Db;
+pub use db::{Db, prefix_successor};
 pub use error::{Error, Result};
 pub use options::{Options, ReadOptions, WalRecoveryMode, WriteOptions};
 pub use backup::{BackupEngine, BackupInfo};

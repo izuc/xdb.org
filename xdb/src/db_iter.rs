@@ -96,6 +96,28 @@ impl DbIterator {
         self.find_next_user_entry();
     }
 
+    /// Position at the last entry with user_key <= `target`.
+    ///
+    /// This is the reverse counterpart to `seek()`: while `seek(target)`
+    /// positions at the first key >= target, `seek_for_prev(target)`
+    /// positions at the last key <= target. Useful for reverse iteration
+    /// from a specific point.
+    pub fn seek_for_prev(&mut self, target: &[u8]) {
+        // Seek forward to the first entry >= target.
+        self.seek(target);
+        if self.valid {
+            // If we landed exactly on target, we're done.
+            if self.saved_key.as_slice() == target {
+                return;
+            }
+            // We overshot (key > target), go back one entry.
+            self.prev();
+        } else {
+            // seek() went past the end — the last key is <= target.
+            self.seek_to_last();
+        }
+    }
+
     /// Advance to the next entry.
     pub fn next(&mut self) {
         assert!(self.valid, "DbIterator::next() called on invalid iterator");

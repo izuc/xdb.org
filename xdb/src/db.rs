@@ -288,6 +288,16 @@ impl Db {
         self.write(WriteOptions::default(), batch)
     }
 
+    /// Check if a key exists in the database.
+    ///
+    /// Unlike `key_may_exist()` (which uses bloom filters and may return
+    /// false positives), this performs a full lookup and returns an exact
+    /// answer. Unlike `get()`, it avoids copying the value bytes when the
+    /// caller only needs to know whether the key is present.
+    pub fn exists(&self, key: &[u8]) -> Result<bool> {
+        self.get(key).map(|v| v.is_some())
+    }
+
     /// Delete all keys in the range `[start_key, end_key)`.
     ///
     /// The start key is inclusive, the end key is exclusive. This writes a
@@ -615,6 +625,21 @@ impl Db {
     /// Create a forward iterator using a specific snapshot.
     pub fn iter_with_snapshot(&self, snapshot: &Snapshot) -> DbIterator {
         self.iter_at_sequence(snapshot.sequence())
+    }
+
+    /// Create an iterator that scans all keys starting with `prefix`.
+    ///
+    /// The iterator is positioned at the first key >= `prefix` and will
+    /// automatically stop when it reaches a key that no longer starts with
+    /// `prefix`. This is equivalent to calling `iter()` with `seek(prefix)`
+    /// and `set_upper_bound(prefix_successor)`.
+    pub fn prefix_iterator(&self, prefix: &[u8]) -> DbIterator {
+        let mut iter = self.iter();
+        if let Some(upper) = prefix_successor(prefix) {
+            iter.set_upper_bound(upper);
+        }
+        iter.seek(prefix);
+        iter
     }
 
     /// Get a reference to the database statistics.
@@ -1795,6 +1820,33 @@ impl Drop for Db {
             let _ = self.close();
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+/// Compute the successor of a prefix for upper-bound iteration.
+///
+/// Returns the smallest byte string that is greater than all strings
+/// starting with `prefix`. For example, `prefix_successor(b"abc")` returns
+/// `Some(b"abd")`. Returns `None` if the prefix is empty or all 0xFF bytes
+/// (meaning all keys match).
+pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    if prefix.is_empty() {
+        return None;
+    }
+    // Find the last byte that is not 0xFF and increment it.
+    let mut upper = prefix.to_vec();
+    while let Some(&last) = upper.last() {
+        if last < 0xFF {
+            *upper.last_mut().unwrap() += 1;
+            return Some(upper);
+        }
+        upper.pop();
+    }
+    // All bytes were 0xFF — no upper bound possible.
+    None
 }
 
 // ---------------------------------------------------------------------------
