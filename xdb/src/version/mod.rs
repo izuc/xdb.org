@@ -249,17 +249,28 @@ impl VersionSet {
         let mut next_file_number: Option<FileNumber> = None;
         let mut last_sequence: Option<SequenceNumber> = None;
 
-        while let Some(edit) = reader.read_edit()? {
-            version = version.apply(&edit);
-
-            if let Some(n) = edit.log_number {
-                log_number = Some(n);
-            }
-            if let Some(n) = edit.next_file_number {
-                next_file_number = Some(n);
-            }
-            if let Some(s) = edit.last_sequence {
-                last_sequence = Some(s);
+        loop {
+            match reader.read_edit() {
+                Ok(Some(edit)) => {
+                    version = version.apply(&edit);
+                    if let Some(n) = edit.log_number {
+                        log_number = Some(n);
+                    }
+                    if let Some(n) = edit.next_file_number {
+                        next_file_number = Some(n);
+                    }
+                    if let Some(s) = edit.last_sequence {
+                        last_sequence = Some(s);
+                    }
+                }
+                Ok(None) => break, // clean EOF
+                Err(_) => {
+                    // Treat errors at the tail of the MANIFEST as a truncated
+                    // write from a crash. The successfully read edits above are
+                    // still valid; we just ignore the incomplete final record.
+                    log::warn!("ignoring truncated record at end of MANIFEST");
+                    break;
+                }
             }
         }
 
