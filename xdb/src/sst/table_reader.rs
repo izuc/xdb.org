@@ -237,11 +237,13 @@ impl TableReader {
             return Ok(None);
         }
 
-        // 3. Decode block handle and read the single data block.
+        // 3. Decode block handle and read the data block.
         let (block_handle, _) = BlockHandle::decode(index_iter.value())
             .ok_or_else(|| Error::corruption("bad block handle in index"))?;
-        let block_data = read_block_from_buf(&self.data, &block_handle)?;
-        let block = BlockReader::new(block_data)?;
+
+        // Zero-copy fast path: verify CRC inline and borrow from the
+        // Arc<Vec<u8>> file buffer for uncompressed blocks (the common case).
+        let block = self.read_block_zero_copy(&block_handle)?;
 
         // 4. Seek within the data block and scan forward.
         let mut data_iter = block.iter();
@@ -270,6 +272,52 @@ impl TableReader {
         }
 
         Ok(None)
+    }
+
+    /// Read a data block with zero-copy for uncompressed blocks.
+    ///
+    /// Verifies the CRC32 checksum inline. For uncompressed blocks (the
+    /// common case), returns a `BlockReader` that borrows directly from
+    /// the file buffer `Arc<Vec<u8>>`, avoiding a memcpy. For compressed
+    /// blocks, falls back to the owned (decompressing) path.
+    fn read_block_zero_copy(&self, handle: &BlockHandle) -> Result<BlockReader> {
+        let offset = handle.offset as usize;
+        let size = handle.size as usize;
+        let total = size + BLOCK_TRAILER_SIZE;
+
+        if offset + total > self.data.len() {
+            return Err(Error::corruption(format!(
+                "block at offset {} size {} extends beyond file ({} bytes)",
+                offset, size, self.data.len()
+            )));
+        }
+
+        let block_data = &self.data[offset..offset + size];
+        let trailer = &self.data[offset + size..offset + total];
+
+        let compression_type = trailer[0];
+        let stored_checksum = u32::from_le_bytes(trailer[1..5].try_into().unwrap());
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(block_data);
+        hasher.update(&[compression_type]);
+        let computed_checksum = hasher.finalize();
+
+        if stored_checksum != computed_checksum {
+            return Err(Error::corruption(format!(
+                "block checksum mismatch at offset {}: stored {:#010x}, computed {:#010x}",
+                offset, stored_checksum, computed_checksum
+            )));
+        }
+
+        if compression_type == compression::COMPRESSION_NONE {
+            // Zero-copy: borrow directly from the Arc<Vec<u8>> file buffer.
+            BlockReader::from_shared(Arc::clone(&self.data), offset, offset + size)
+        } else {
+            // Compressed: must decompress into an owned buffer.
+            let decompressed = compression::decompress(block_data, compression_type)?;
+            BlockReader::new(decompressed)
+        }
     }
 
     /// Iterate over all key-value pairs in the table.

@@ -35,7 +35,7 @@ use crate::version::{Version, VersionSet};
 use crate::wal::WalWriter;
 
 use crossbeam_channel::Sender;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -64,7 +64,7 @@ enum BgWork {
 pub struct Db {
     dbname: PathBuf,
     options: Arc<Options>,
-    state: Mutex<DbState>,
+    state: RwLock<DbState>,
     table_cache: Arc<TableCache>,
     snapshots: SnapshotList,
     stats: Arc<Statistics>,
@@ -182,7 +182,7 @@ impl Db {
         let db = Arc::new(Db {
             dbname,
             options: opts,
-            state: Mutex::new(DbState {
+            state: RwLock::new(DbState {
                 mem: Arc::new(MemTable::new()),
                 imm: None,
                 wal: Some(WalWriter::new(wal_file)),
@@ -243,7 +243,7 @@ impl Db {
         Statistics::record(&self.stats.reads, 1);
 
         let (mem, imm, version, sequence) = {
-            let state = self.state.lock();
+            let state = self.state.read();
             (
                 Arc::clone(&state.mem),
                 state.imm.as_ref().map(Arc::clone),
@@ -422,7 +422,7 @@ impl Db {
             return Ok(());
         }
 
-        let mut state = self.state.lock();
+        let mut state = self.state.write();
         self.make_room_for_write(&mut state)?;
 
         let last_seq = state.versions.last_sequence();
@@ -458,7 +458,7 @@ impl Db {
 
     /// Force flush the current memtable to disk.
     pub fn flush(&self) -> Result<()> {
-        let mut state = self.state.lock();
+        let mut state = self.state.write();
 
         if state.mem.is_empty() {
             return Ok(());
@@ -489,7 +489,7 @@ impl Db {
     /// The snapshot can be used with `ReadOptions` to perform consistent reads.
     /// Drop or release the snapshot when no longer needed.
     pub fn snapshot(&self) -> Arc<Snapshot> {
-        let seq = self.state.lock().versions.last_sequence();
+        let seq = self.state.read().versions.last_sequence();
         self.snapshots.create(seq)
     }
 
@@ -505,7 +505,7 @@ impl Db {
     /// Entries are yielded in user-key order with deletions hidden and
     /// duplicates resolved to the newest version.
     pub fn iter(&self) -> DbIterator {
-        let seq = self.state.lock().versions.last_sequence();
+        let seq = self.state.read().versions.last_sequence();
         self.iter_at_sequence(seq)
     }
 
@@ -539,7 +539,7 @@ impl Db {
             let _ = handle.join();
         }
 
-        let mut state = self.state.lock();
+        let mut state = self.state.write();
         if !state.mem.is_empty() {
             let old_mem = std::mem::replace(&mut state.mem, Arc::new(MemTable::new()));
             state.imm = Some(old_mem);
@@ -572,7 +572,7 @@ impl Db {
     /// Build a DbIterator at a given sequence number.
     fn iter_at_sequence(&self, sequence: SequenceNumber) -> DbIterator {
         let (mem, imm, version) = {
-            let state = self.state.lock();
+            let state = self.state.read();
             (
                 Arc::clone(&state.mem),
                 state.imm.as_ref().map(Arc::clone),
@@ -921,7 +921,7 @@ impl Db {
     fn do_background_flush(&self) -> Result<()> {
         // Step 1: Take the immutable memtable and file info under lock.
         let (imm, file_number, log_number, sst_path) = {
-            let mut state = self.state.lock();
+            let mut state = self.state.write();
             let imm = match state.imm.take() {
                 Some(m) => m,
                 None => return Ok(()),
@@ -937,7 +937,7 @@ impl Db {
         let flush_result = self.write_memtable_to_sst(&imm, &sst_path);
 
         // Step 3: Re-acquire lock to apply the edit or restore imm.
-        let mut state = self.state.lock();
+        let mut state = self.state.write();
 
         match flush_result {
             Ok((file_size, smallest_key, largest_key)) => {
@@ -1010,7 +1010,7 @@ impl Db {
 
             // Step 1: Pick compaction under lock.
             let comp_info = {
-                let mut state = self.state.lock();
+                let mut state = self.state.write();
                 state.bg_compaction_scheduled = false;
 
                 match state.versions.pick_compaction() {
@@ -1063,7 +1063,7 @@ impl Db {
 
             // Step 3: Apply the edit under lock.
             let apply_result = {
-                let mut state = self.state.lock();
+                let mut state = self.state.write();
                 while state.versions.manifest_file_number() < next_file {
                     state.versions.new_file_number();
                 }
@@ -1095,7 +1095,7 @@ impl Db {
         // If we hit the round limit and there's still work, re-schedule
         // so the background thread picks it up on the next iteration.
         if !self.shutting_down.load(AtomicOrdering::Acquire) {
-            let state = self.state.lock();
+            let state = self.state.read();
             if state.versions.pick_compaction().is_some() {
                 let _ = self.bg_sender.send(BgWork::MaybeCompact);
             }

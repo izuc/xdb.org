@@ -148,12 +148,26 @@ impl<'a> ParsedInternalKey<'a> {
 // LookupKey — convenience for point queries
 // ---------------------------------------------------------------------------
 
+/// Maximum size for inline (stack-allocated) lookup key storage.
+///
+/// Covers keys up to ~243 user-key bytes without a heap allocation.
+/// `256 = 5 (varint32 max) + 243 (user key) + 8 (tag)`.
+const LOOKUP_KEY_INLINE_CAP: usize = 256;
+
 /// A helper that encodes the key used for memtable lookups.
 ///
 /// Format: `klength(varint32) | user_key | tag(8)` where
 /// `klength = user_key.len() + 8`.
+///
+/// Uses inline stack storage for small keys (the common case) to avoid
+/// a heap allocation on every point lookup.
 pub struct LookupKey {
-    data: Vec<u8>,
+    /// Inline storage for small keys (common case -- no heap allocation).
+    inline: [u8; LOOKUP_KEY_INLINE_CAP],
+    /// If the key doesn't fit inline, spill to heap.
+    heap: Option<Vec<u8>>,
+    /// Total number of bytes written (varint + user_key + tag).
+    len: usize,
     /// Offset where the internal key starts (after the varint length prefix).
     key_start: usize,
 }
@@ -166,28 +180,80 @@ impl LookupKey {
             "user key too large ({} bytes)",
             user_key.len()
         );
-        let mut data = Vec::with_capacity(5 + internal_len); // varint32 max 5 bytes
-        encode_varint32(&mut data, internal_len as u32);
-        let key_start = data.len();
-        data.extend_from_slice(user_key);
+        let varint_len = varint32_length(internal_len as u32);
+        let total_len = varint_len + internal_len;
         let tag = (sequence << 8) | (ValueType::Value as u64);
-        data.extend_from_slice(&tag.to_le_bytes());
-        LookupKey { data, key_start }
+
+        if total_len <= LOOKUP_KEY_INLINE_CAP {
+            // Fast path: write directly into stack buffer.
+            let mut inline = [0u8; LOOKUP_KEY_INLINE_CAP];
+            // Encode varint32 inline.
+            let mut pos = 0;
+            let mut v = internal_len as u32;
+            loop {
+                if v < 0x80 {
+                    inline[pos] = v as u8;
+                    pos += 1;
+                    break;
+                }
+                inline[pos] = (v as u8) | 0x80;
+                v >>= 7;
+                pos += 1;
+            }
+            let key_start = pos;
+            inline[pos..pos + user_key.len()].copy_from_slice(user_key);
+            pos += user_key.len();
+            inline[pos..pos + 8].copy_from_slice(&tag.to_le_bytes());
+            pos += 8;
+            LookupKey {
+                inline,
+                heap: None,
+                len: pos,
+                key_start,
+            }
+        } else {
+            // Rare path: key too large, spill to heap.
+            let mut data = Vec::with_capacity(total_len);
+            encode_varint32(&mut data, internal_len as u32);
+            let key_start = data.len();
+            data.extend_from_slice(user_key);
+            data.extend_from_slice(&tag.to_le_bytes());
+            let len = data.len();
+            LookupKey {
+                inline: [0u8; LOOKUP_KEY_INLINE_CAP],
+                heap: Some(data),
+                len,
+                key_start,
+            }
+        }
+    }
+
+    /// Return a reference to the underlying storage bytes.
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        match self.heap {
+            Some(ref v) => &v[..self.len],
+            None => &self.inline[..self.len],
+        }
     }
 
     /// Full memtable key (length-prefixed internal key).
+    #[inline]
     pub fn memtable_key(&self) -> &[u8] {
-        &self.data
+        self.as_bytes()
     }
 
     /// Just the internal key portion (user_key + tag).
+    #[inline]
     pub fn internal_key(&self) -> &[u8] {
-        &self.data[self.key_start..]
+        &self.as_bytes()[self.key_start..]
     }
 
     /// Just the user key.
+    #[inline]
     pub fn user_key(&self) -> &[u8] {
-        &self.data[self.key_start..self.data.len() - 8]
+        let bytes = self.as_bytes();
+        &bytes[self.key_start..bytes.len() - 8]
     }
 }
 

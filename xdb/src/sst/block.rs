@@ -22,6 +22,8 @@
 //! value:               [value_length bytes]
 //! ```
 
+use std::sync::Arc;
+
 use crate::error;
 use crate::types::{decode_varint32, encode_varint32};
 
@@ -152,43 +154,86 @@ fn shared_prefix_len(a: &[u8], b: &[u8]) -> usize {
 // BlockReader
 // ---------------------------------------------------------------------------
 
+/// Internal storage for block data: either an owned `Vec<u8>` or a shared
+/// slice into an `Arc<Vec<u8>>` (zero-copy for uncompressed blocks).
+enum BlockData {
+    Owned(Vec<u8>),
+    Shared {
+        data: Arc<Vec<u8>>,
+        start: usize,
+        end: usize,
+    },
+}
+
+impl BlockData {
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            BlockData::Owned(v) => v,
+            BlockData::Shared { data, start, end } => &data[*start..*end],
+        }
+    }
+}
+
 /// Reads a block produced by [`BlockBuilder`].
 ///
-/// Owns the raw block data and provides an iterator over its entries.
+/// Owns (or borrows via `Arc`) the raw block data and provides an iterator
+/// over its entries.
 pub struct BlockReader {
-    data: Vec<u8>,
+    data: BlockData,
     restarts_offset: usize,
     num_restarts: u32,
 }
 
 impl BlockReader {
-    /// Parse a block from raw bytes (the bytes returned by
+    /// Parse a block from raw owned bytes (the bytes returned by
     /// [`BlockBuilder::finish`], without the 5-byte on-disk trailer).
     pub fn new(data: Vec<u8>) -> error::Result<Self> {
-        if data.len() < 4 {
+        let (restarts_offset, num_restarts) = Self::parse_restarts(data.len(), &data)?;
+        Ok(BlockReader {
+            data: BlockData::Owned(data),
+            restarts_offset,
+            num_restarts,
+        })
+    }
+
+    /// Create a `BlockReader` that references a slice of a shared buffer
+    /// without copying. The `Arc<Vec<u8>>` keeps the underlying data alive.
+    pub fn from_shared(buf: Arc<Vec<u8>>, start: usize, end: usize) -> error::Result<Self> {
+        let slice = &buf[start..end];
+        let (restarts_offset, num_restarts) = Self::parse_restarts(slice.len(), slice)?;
+        Ok(BlockReader {
+            data: BlockData::Shared {
+                data: buf,
+                start,
+                end,
+            },
+            restarts_offset,
+            num_restarts,
+        })
+    }
+
+    /// Validate the restart array at the end of a block and return
+    /// `(restarts_offset, num_restarts)`.
+    fn parse_restarts(len: usize, data: &[u8]) -> error::Result<(usize, u32)> {
+        if len < 4 {
             return Err(error::Error::corruption(
                 "block too short to contain num_restarts",
             ));
         }
 
-        let num_restarts =
-            u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
+        let num_restarts = u32::from_le_bytes(data[len - 4..len].try_into().unwrap());
 
         let restarts_byte_len = (num_restarts as usize) * 4 + 4;
-        if restarts_byte_len > data.len() {
+        if restarts_byte_len > len {
             return Err(error::Error::corruption(format!(
                 "num_restarts ({}) implies {} bytes but block is only {} bytes",
-                num_restarts, restarts_byte_len, data.len()
+                num_restarts, restarts_byte_len, len
             )));
         }
 
-        let restarts_offset = data.len() - restarts_byte_len;
-
-        Ok(BlockReader {
-            data,
-            restarts_offset,
-            num_restarts,
-        })
+        let restarts_offset = len - restarts_byte_len;
+        Ok((restarts_offset, num_restarts))
     }
 
     /// Create an iterator over the entries in this block.
@@ -212,18 +257,19 @@ impl BlockReader {
 
     /// Get the byte offset stored at the given restart index.
     fn restart_offset(&self, index: usize) -> usize {
+        let data = self.data.as_slice();
         assert!((index as u32) < self.num_restarts);
         let pos = self
             .restarts_offset
             .checked_add(index.checked_mul(4).expect("restart index overflow"))
             .expect("restart offset overflow");
         assert!(
-            pos + 4 <= self.data.len(),
+            pos + 4 <= data.len(),
             "restart offset out of bounds: {} + 4 > {}",
             pos,
-            self.data.len()
+            data.len()
         );
-        u32::from_le_bytes(self.data[pos..pos + 4].try_into().unwrap()) as usize
+        u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize
     }
 
     /// The byte offset where entry data ends (start of restart array).
@@ -408,7 +454,7 @@ impl<'a> BlockIterator<'a> {
     /// Returns the current value. Only valid when [`valid`](Self::valid) is true.
     pub fn value(&self) -> &[u8] {
         debug_assert!(self.valid);
-        &self.block.data[self.value_offset..self.value_offset + self.value_len]
+        &self.block.data.as_slice()[self.value_offset..self.value_offset + self.value_len]
     }
 
     // -- internal helpers ---------------------------------------------------
@@ -434,7 +480,8 @@ impl<'a> BlockIterator<'a> {
         }
 
         self.entry_offset = self.current;
-        let data = &self.block.data[self.current..self.block.data_end()];
+        let block_data = self.block.data.as_slice();
+        let data = &block_data[self.current..self.block.data_end()];
 
         let (shared, n1) = match decode_varint32(data) {
             Some(v) => v,
@@ -504,7 +551,8 @@ impl<'a> BlockIterator<'a> {
         target: &[u8],
     ) -> std::cmp::Ordering {
         let offset = self.block.restart_offset(restart_index);
-        let data = &self.block.data[offset..self.block.data_end()];
+        let block_data = self.block.data.as_slice();
+        let data = &block_data[offset..self.block.data_end()];
 
         let (_shared, n1) = match decode_varint32(data) {
             Some(v) => v,
