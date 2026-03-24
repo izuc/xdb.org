@@ -281,7 +281,7 @@ impl DbIterator {
         for (start, end, tomb_seq) in &self.range_tombstones {
             if user_key >= start.as_slice()
                 && user_key < end.as_slice()
-                && *tomb_seq >= seq
+                && *tomb_seq > seq
                 && *tomb_seq <= self.sequence
             {
                 return true;

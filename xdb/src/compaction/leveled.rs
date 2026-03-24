@@ -176,7 +176,7 @@ pub fn compact(
                         if start.as_slice() > user_key {
                             return false;
                         }
-                        user_key < end.as_slice() && *tomb_seq >= seq
+                        user_key < end.as_slice() && *tomb_seq > seq
                     })
                 })
                 .unwrap_or(false);
