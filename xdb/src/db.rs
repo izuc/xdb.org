@@ -258,16 +258,55 @@ impl Db {
             )
         };
 
-        let lookup = LookupKey::new(key, sequence);
-
-        // Fast-path: check whether ANY range tombstones could exist.
-        // Memtable flags are atomic booleans (no lock needed). If neither
-        // memtable has range tombstones, we can defer the expensive SST
-        // tombstone scan until we actually find a value -- and even then
-        // we only need to check the specific reader that produced it plus
-        // the memtable flags.
         let mem_has_tombstones = mem.has_range_tombstones()
             || imm.as_ref().is_some_and(|i| i.has_range_tombstones());
+
+        self.get_with_state(key, sequence, &mem, imm.as_deref(), &version, mem_has_tombstones)
+    }
+
+    /// Look up multiple keys in a single call.
+    ///
+    /// More efficient than calling `get()` for each key because the state
+    /// snapshot and range tombstone collection are shared across all lookups.
+    pub fn multi_get(&self, keys: &[&[u8]]) -> Vec<Result<Option<Vec<u8>>>> {
+        if self.shutting_down.load(AtomicOrdering::Acquire) {
+            return keys.iter().map(|_| Err(Error::ShutdownInProgress)).collect();
+        }
+
+        let (mem, imm, version, sequence) = {
+            let state = self.state.read();
+            (
+                Arc::clone(&state.mem),
+                state.imm.as_ref().map(Arc::clone),
+                state.versions.current(),
+                state.versions.last_sequence(),
+            )
+        };
+
+        let mem_has_tombstones = mem.has_range_tombstones()
+            || imm.as_ref().is_some_and(|i| i.has_range_tombstones());
+
+        keys.iter()
+            .map(|key| {
+                self.get_with_state(key, sequence, &mem, imm.as_deref(), &version, mem_has_tombstones)
+            })
+            .collect()
+    }
+
+    /// Core lookup logic shared by `get()` and `multi_get()`.
+    ///
+    /// Searches the memtable, immutable memtable, and SST files for the given
+    /// key at the specified sequence number.
+    fn get_with_state(
+        &self,
+        key: &[u8],
+        sequence: SequenceNumber,
+        mem: &MemTable,
+        imm: Option<&MemTable>,
+        version: &Version,
+        mem_has_tombstones: bool,
+    ) -> Result<Option<Vec<u8>>> {
+        let lookup = LookupKey::new(key, sequence);
 
         // 1. Active memtable.
         if let Some(result) = mem.get(&lookup) {
@@ -276,7 +315,7 @@ impl Db {
                 Ok((value, value_seq)) => {
                     if mem_has_tombstones {
                         let range_tombstones = self.collect_range_tombstones_for_get(
-                            key, &mem, imm.as_deref(), &version, sequence,
+                            key, mem, imm, version, sequence,
                         );
                         if Self::is_key_range_deleted(key, value_seq, &range_tombstones) {
                             return Ok(None);
@@ -291,14 +330,14 @@ impl Db {
         }
 
         // 2. Immutable memtable.
-        if let Some(ref imm_table) = imm {
+        if let Some(imm_table) = imm {
             if let Some(result) = imm_table.get(&lookup) {
                 Statistics::record(&self.stats.memtable_hits, 1);
                 return match result {
                     Ok((value, value_seq)) => {
                         if mem_has_tombstones {
                             let range_tombstones = self.collect_range_tombstones_for_get(
-                                key, &mem, imm.as_deref(), &version, sequence,
+                                key, mem, imm, version, sequence,
                             );
                             if Self::is_key_range_deleted(key, value_seq, &range_tombstones) {
                                 return Ok(None);
@@ -325,8 +364,8 @@ impl Db {
             match self.search_sst_file(file_meta, key, sequence)? {
                 SearchResult::Found(value, value_seq) => {
                     if self.check_range_tombstones_for_found_key(
-                        key, value_seq, mem_has_tombstones, &mem, imm.as_deref(),
-                        &version, sequence,
+                        key, value_seq, mem_has_tombstones, mem, imm,
+                        version, sequence,
                     )? {
                         return Ok(None);
                     }
@@ -354,8 +393,8 @@ impl Db {
             match self.search_sst_file(file_meta, key, sequence)? {
                 SearchResult::Found(value, value_seq) => {
                     if self.check_range_tombstones_for_found_key(
-                        key, value_seq, mem_has_tombstones, &mem, imm.as_deref(),
-                        &version, sequence,
+                        key, value_seq, mem_has_tombstones, mem, imm,
+                        version, sequence,
                     )? {
                         return Ok(None);
                     }
@@ -525,6 +564,135 @@ impl Db {
     /// Get a reference to the database statistics.
     pub fn stats(&self) -> &Statistics {
         &self.stats
+    }
+
+    /// Query internal database statistics by property name.
+    ///
+    /// Returns `None` for unrecognized property names. Supported properties:
+    ///
+    /// - `"xdb.num-files-at-levelN"` -- number of SST files at level N
+    /// - `"xdb.num-levels"` -- total number of levels
+    /// - `"xdb.last-sequence"` -- current sequence number
+    /// - `"xdb.num-snapshots"` -- number of active snapshots
+    /// - `"xdb.num-entries"` -- approximate total entries (sum of all file counts)
+    /// - `"xdb.total-sst-size"` -- total bytes across all SST files
+    /// - `"xdb.mem-usage"` -- approximate memtable memory usage
+    /// - `"xdb.background-errors"` -- placeholder, always `"0"`
+    /// - `"xdb.level-summary"` -- one-line summary like `"L0:3 L1:10 L2:45 ..."`
+    pub fn get_property(&self, name: &str) -> Option<String> {
+        let state = self.state.read();
+        let version = state.versions.current();
+
+        match name {
+            "xdb.num-levels" => Some(version.num_levels.to_string()),
+            "xdb.last-sequence" => Some(state.versions.last_sequence().to_string()),
+            "xdb.num-snapshots" => Some(self.snapshots.count().to_string()),
+            "xdb.num-entries" => Some(version.total_file_count().to_string()),
+            "xdb.mem-usage" => Some(state.mem.approximate_memory_usage().to_string()),
+            "xdb.background-errors" => Some("0".to_string()),
+            "xdb.total-sst-size" => {
+                let total: u64 = (0..version.num_levels)
+                    .flat_map(|l| version.files_at_level(l))
+                    .map(|f| f.file_size)
+                    .sum();
+                Some(total.to_string())
+            }
+            "xdb.level-summary" => {
+                let parts: Vec<String> = (0..version.num_levels)
+                    .map(|l| format!("L{}:{}", l, version.files_at_level(l).len()))
+                    .collect();
+                Some(parts.join(" "))
+            }
+            _ => {
+                // Check for "xdb.num-files-at-levelN"
+                if let Some(level_str) = name.strip_prefix("xdb.num-files-at-level") {
+                    if let Ok(level) = level_str.parse::<usize>() {
+                        if level < version.num_levels {
+                            return Some(version.files_at_level(level).len().to_string());
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Manually compact a key range across all levels.
+    ///
+    /// If `start` and `end` are both `None`, the entire database is compacted.
+    /// This is a synchronous operation that blocks until complete.
+    pub fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
+        use crate::compaction;
+
+        for level in 0..self.options.num_levels - 1 {
+            let mut state = self.state.write();
+            let version = state.versions.current();
+            let files = version.files_at_level(level);
+
+            if files.is_empty() {
+                continue;
+            }
+
+            // Check if any files at this level overlap the range.
+            let has_overlap = match (start, end) {
+                (None, None) => true,
+                (Some(s), Some(e)) => files.iter().any(|f| {
+                    f.smallest_key.user_key() <= e && f.largest_key.user_key() >= s
+                }),
+                (Some(s), None) => files.iter().any(|f| f.largest_key.user_key() >= s),
+                (None, Some(e)) => files.iter().any(|f| f.smallest_key.user_key() <= e),
+            };
+
+            if !has_overlap {
+                continue;
+            }
+
+            // Build a CompactionState for this level.
+            let comp_state = compaction::pick_compaction_files(&version, level, &self.options);
+            if comp_state.input_files[0].is_empty() {
+                continue;
+            }
+
+            // Pre-allocate file numbers for compaction output.
+            let input_count: usize = comp_state.input_files.iter().map(|f| f.len()).sum();
+            let prealloc = (input_count + 10).max(20);
+            let mut next_file = state.versions.new_file_number();
+            for _ in 0..prealloc {
+                let _ = state.versions.new_file_number();
+            }
+
+            // Release lock during I/O.
+            drop(state);
+
+            let mut comp_state = comp_state;
+            let edit = compaction::compact(
+                &self.dbname,
+                &mut comp_state,
+                &self.options,
+                &mut next_file,
+            )?;
+
+            // Re-acquire lock to apply edit.
+            let mut state = self.state.write();
+            while state.versions.manifest_file_number() < next_file {
+                state.versions.new_file_number();
+            }
+            state.versions.log_and_apply(edit)?;
+            drop(state);
+
+            // Cleanup compacted input files.
+            for files in &comp_state.input_files {
+                for f in files {
+                    self.table_cache.evict(f.number);
+                    if let Err(e) = fs::remove_file(self.dbname.join(sst_file_name(f.number))) {
+                        log::warn!("failed to delete compacted file: {}", e);
+                    }
+                }
+            }
+            self.sync_dir();
+        }
+
+        Ok(())
     }
 
     /// Graceful shutdown: flush pending data and stop background threads.
