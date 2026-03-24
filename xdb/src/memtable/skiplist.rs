@@ -97,11 +97,30 @@ impl SkipList {
     }
 
     /// Generate a random height in [1, MAX_HEIGHT] with P = 1/BRANCHING_FACTOR.
+    ///
+    /// Uses a fast thread-local xorshift32 PRNG instead of the
+    /// cryptographic-strength `rand::random()` — skiplist level
+    /// selection doesn't need crypto quality and this is on the
+    /// hot write path.
     fn random_height() -> usize {
-        let mut height = 1;
-        while height < MAX_HEIGHT && rand::random::<u32>().is_multiple_of(BRANCHING_FACTOR) {
-            height += 1;
+        use std::cell::Cell;
+        thread_local! {
+            static RNG: Cell<u32> = const { Cell::new(0xdeadbeef) };
         }
+        let mut height = 1;
+        RNG.with(|rng| {
+            while height < MAX_HEIGHT {
+                let mut x = rng.get();
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                rng.set(x);
+                if x % BRANCHING_FACTOR != 0 {
+                    break;
+                }
+                height += 1;
+            }
+        });
         height
     }
 

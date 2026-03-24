@@ -79,7 +79,8 @@ impl WalWriter {
             // If fewer than HEADER_SIZE bytes remain, pad with zeros.
             if leftover < HEADER_SIZE {
                 if leftover > 0 {
-                    self.writer.write_all(&vec![0u8; leftover])?;
+                    const ZEROS: [u8; HEADER_SIZE] = [0; HEADER_SIZE];
+                    self.writer.write_all(&ZEROS[..leftover])?;
                 }
                 self.block_offset = 0;
             }

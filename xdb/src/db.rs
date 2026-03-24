@@ -367,6 +367,10 @@ impl Db {
 
         if let Some(ref mut wal) = state.wal {
             wal.add_record(batch.data())?;
+            // Note: sync is under the lock because WalWriter::sync requires
+            // &mut self. Moving the WAL to a separate Mutex would allow
+            // sync outside the state lock (group commit). Acceptable for now
+            // since sync_writes=false is the default.
             if write_opts.sync || self.options.sync_writes {
                 wal.sync()?;
             }
@@ -515,33 +519,23 @@ impl Db {
             Self::collect_range_tombstones_from_mem(imm, sequence, &mut range_tombstones);
         }
 
-        // SST file iterators + range tombstones in a SINGLE pass.
-        // This avoids a race where concurrent compaction deletes a file
-        // between two separate get_reader calls.
+        // SST file iterators + range tombstones in a single pass.
         for level in 0..version.num_levels {
             for file_meta in version.files_at_level(level) {
                 if let Ok(reader) = self.table_cache.get_reader(
                     file_meta.number,
                     file_meta.file_size,
                 ) {
-                    // Scan for range tombstones from this reader.
-                    let mut scan = reader.iter();
-                    scan.seek_to_first();
-                    while scan.valid() {
-                        if let Some(p) = ParsedInternalKey::from_bytes(scan.key()) {
-                            if p.value_type == ValueType::RangeDeletion
-                                && p.sequence <= sequence
-                            {
-                                range_tombstones.push((
-                                    p.user_key.to_vec(),
-                                    scan.value().to_vec(),
-                                    p.sequence,
-                                ));
-                            }
+                    // Use cached range tombstones (parsed once at open time).
+                    for (start, end, tomb_seq) in reader.range_tombstones() {
+                        if *tomb_seq <= sequence {
+                            range_tombstones.push((
+                                start.clone(),
+                                end.clone(),
+                                *tomb_seq,
+                            ));
                         }
-                        scan.next();
                     }
-                    // Create the merge child iterator from the same reader.
                     children.push(Box::new(reader.iter()));
                 }
             }
@@ -571,8 +565,9 @@ impl Db {
 
     /// Collect range tombstones relevant to a point lookup for a specific key.
     ///
-    /// Only collects tombstones whose range covers `user_key`, avoiding a
-    /// full scan when no tombstones exist near the target.
+    /// Uses cached tombstones from each `TableReader` (parsed once at open
+    /// time) instead of scanning entire SST files. This keeps point lookups
+    /// O(log N) instead of O(N).
     fn collect_range_tombstones_for_get(
         &self,
         user_key: &[u8],
@@ -589,44 +584,20 @@ impl Db {
             Self::collect_range_tombstones_from_mem(imm, sequence, &mut tombstones);
         }
 
-        // SST file range tombstones — only scan files whose key range
-        // could contain a tombstone covering user_key.
+        // SST file range tombstones — use cached tombstones parsed at open time.
         for level in 0..version.num_levels {
             for file_meta in version.files_at_level(level) {
-                // Quick skip: if the file's key range doesn't overlap user_key,
-                // it can't have a relevant range tombstone whose start <= user_key.
-                if file_meta.smallest_key.user_key() > user_key {
-                    continue;
-                }
                 if let Ok(reader) = self.table_cache.get_reader(
                     file_meta.number,
                     file_meta.file_size,
                 ) {
-                    let mut scan = reader.iter();
-                    scan.seek_to_first();
-                    while scan.valid() {
-                        if let Some(p) = ParsedInternalKey::from_bytes(scan.key()) {
-                            if p.value_type == ValueType::RangeDeletion
-                                && p.sequence <= sequence
-                                && p.user_key <= user_key
-                            {
-                                let end = scan.value();
-                                if user_key < end {
-                                    tombstones.push((
-                                        p.user_key.to_vec(),
-                                        end.to_vec(),
-                                        p.sequence,
-                                    ));
-                                }
-                            }
-                            // Range tombstone start keys are user keys.
-                            // If start > user_key, no further tombstones
-                            // in this file can cover user_key.
-                            if p.user_key > user_key {
-                                break;
-                            }
+                    for (start, end, tomb_seq) in reader.range_tombstones() {
+                        if *tomb_seq <= sequence
+                            && start.as_slice() <= user_key
+                            && user_key < end.as_slice()
+                        {
+                            tombstones.push((start.clone(), end.clone(), *tomb_seq));
                         }
-                        scan.next();
                     }
                 }
             }
@@ -720,7 +691,13 @@ impl Db {
             iter.next();
         }
 
-        let file_size = builder.finish()?;
+        let file_size = match builder.finish() {
+            Ok(size) => size,
+            Err(e) => {
+                let _ = fs::remove_file(&sst_path);
+                return Err(e);
+            }
+        };
 
         // Throttle flush I/O via rate limiter if configured.
         if let Some(ref limiter) = self.options.rate_limiter {
@@ -835,6 +812,12 @@ impl Db {
         const MAX_COMPACTION_ROUNDS: usize = 32;
 
         for _round in 0..MAX_COMPACTION_ROUNDS {
+            // Abort early if the database is shutting down so close()
+            // doesn't block waiting for a long-running compaction.
+            if self.shutting_down.load(AtomicOrdering::Acquire) {
+                break;
+            }
+
             // Step 1: Pick compaction under lock.
             let comp_info = {
                 let mut state = self.state.lock();
@@ -951,7 +934,13 @@ impl Db {
             iter.next();
         }
 
-        let file_size = builder.finish()?;
+        let file_size = match builder.finish() {
+            Ok(size) => size,
+            Err(e) => {
+                let _ = fs::remove_file(&sst_path);
+                return Err(e);
+            }
+        };
 
         if let (true, Some(sk)) = (file_size > 0, smallest_key) {
             let meta = FileMetaData {

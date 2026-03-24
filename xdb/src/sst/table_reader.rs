@@ -30,6 +30,9 @@ pub struct TableReader {
     index_block: BlockReader,
     /// Raw bloom filter data (if present).
     filter_data: Option<Vec<u8>>,
+    /// Cached range tombstones: (start_user_key, end_user_key, sequence).
+    /// Parsed once at open time so point lookups don't need to scan the file.
+    range_tombstones: Vec<(Vec<u8>, Vec<u8>, u64)>,
     #[allow(dead_code)]
     options: Options,
 }
@@ -77,12 +80,60 @@ impl TableReader {
             }
         };
 
+        let data = Arc::new(data);
+
+        // Pre-parse range tombstones so point lookups can check them cheaply.
+        let range_tombstones = Self::scan_range_tombstones(&data, &index_block);
+
         Ok(TableReader {
-            data: Arc::new(data),
+            data,
             index_block,
             filter_data,
+            range_tombstones,
             options,
         })
+    }
+
+    /// Scan all entries at open time to extract range tombstones.
+    fn scan_range_tombstones(
+        data: &[u8],
+        index_block: &BlockReader,
+    ) -> Vec<(Vec<u8>, Vec<u8>, u64)> {
+        use crate::types::{ParsedInternalKey, ValueType};
+
+        let mut tombstones = Vec::new();
+        let mut idx_iter = index_block.iter();
+        idx_iter.seek_to_first();
+
+        while idx_iter.valid() {
+            if let Some((handle, _)) = BlockHandle::decode(idx_iter.value()) {
+                if let Ok(block_data) = read_block_from_buf(data, &handle) {
+                    if let Ok(block) = BlockReader::new(block_data) {
+                        let mut entry_iter = block.iter();
+                        entry_iter.seek_to_first();
+                        while entry_iter.valid() {
+                            if let Some(p) = ParsedInternalKey::from_bytes(entry_iter.key()) {
+                                if p.value_type == ValueType::RangeDeletion {
+                                    tombstones.push((
+                                        p.user_key.to_vec(),
+                                        entry_iter.value().to_vec(),
+                                        p.sequence,
+                                    ));
+                                }
+                            }
+                            entry_iter.next();
+                        }
+                    }
+                }
+            }
+            idx_iter.next();
+        }
+        tombstones
+    }
+
+    /// Cached range tombstones parsed at open time.
+    pub fn range_tombstones(&self) -> &[(Vec<u8>, Vec<u8>, u64)] {
+        &self.range_tombstones
     }
 
     /// Check whether the bloom filter indicates the user key might exist.

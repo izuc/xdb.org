@@ -12,7 +12,6 @@ thiserror = "2"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
 crossbeam-utils = "0.8"
-rand = "0.9"
 log = "0.4"
 lz4_flex = { version = "0.11", optional = true }
 zstd = { version = "0.13", optional = true, features = ["zstdmt"] }
