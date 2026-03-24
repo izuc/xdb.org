@@ -35,17 +35,20 @@ pub struct TableCache {
     cache: RwLock<CacheInner>,
 }
 
+/// Number of direct-mapped slots for O(1) cache hits without hashing.
+const FAST_SLOTS: usize = 256;
+
 struct CacheInner {
+    /// Direct-mapped fast path: file_number % FAST_SLOTS → slot.
+    fast: Vec<Option<(FileNumber, Arc<TableReader>)>>,
+    /// Overflow map for collisions (rare).
     readers: HashMap<FileNumber, CacheEntry>,
     max_open: usize,
-    /// Monotonically increasing counter, bumped only on inserts (write path).
     insert_counter: u64,
 }
 
 struct CacheEntry {
     reader: Arc<TableReader>,
-    /// Insertion order for LRU eviction (set once on insert, never updated
-    /// on read so the read path stays lock-free).
     insert_order: u64,
 }
 
@@ -60,6 +63,11 @@ impl TableCache {
             dbname: dbname.to_path_buf(),
             options,
             cache: RwLock::new(CacheInner {
+                fast: {
+                    let mut v = Vec::with_capacity(FAST_SLOTS);
+                    v.resize_with(FAST_SLOTS, || None);
+                    v
+                },
                 readers: HashMap::new(),
                 max_open: max_open_files,
                 insert_counter: 0,
@@ -75,9 +83,16 @@ impl TableCache {
     ///
     /// `file_size` is required when opening the file for the first time.
     pub fn get_reader(&self, file_number: FileNumber, file_size: u64) -> Result<Arc<TableReader>> {
-        // Fast path: read lock for cache hits.
+        // Fastest path: direct-mapped slot lookup (no hashing).
         {
             let inner = self.cache.read();
+            let slot = (file_number as usize) % FAST_SLOTS;
+            if let Some((num, reader)) = &inner.fast[slot] {
+                if *num == file_number {
+                    return Ok(Arc::clone(reader));
+                }
+            }
+            // Fallback: HashMap lookup for collisions.
             if let Some(entry) = inner.readers.get(&file_number) {
                 return Ok(Arc::clone(&entry.reader));
             }
@@ -101,6 +116,10 @@ impl TableCache {
         inner.insert_counter += 1;
         let insert_order = inner.insert_counter;
 
+        // Populate the fast direct-mapped slot.
+        let slot = (file_number as usize) % FAST_SLOTS;
+        inner.fast[slot] = Some((file_number, Arc::clone(&reader)));
+
         inner.readers.insert(
             file_number,
             CacheEntry {
@@ -122,12 +141,23 @@ impl TableCache {
     /// This should be called after an SST file is deleted (e.g., by
     /// compaction) so that the cache does not hold a stale reference.
     pub fn evict(&self, file_number: FileNumber) {
-        self.cache.write().readers.remove(&file_number);
+        let mut inner = self.cache.write();
+        let slot = (file_number as usize) % FAST_SLOTS;
+        if let Some((num, _)) = &inner.fast[slot] {
+            if *num == file_number {
+                inner.fast[slot] = None;
+            }
+        }
+        inner.readers.remove(&file_number);
     }
 
     /// Remove all cached readers.
     pub fn evict_all(&self) {
-        self.cache.write().readers.clear();
+        let mut inner = self.cache.write();
+        for slot in inner.fast.iter_mut() {
+            *slot = None;
+        }
+        inner.readers.clear();
     }
 
     /// Return the number of currently cached readers.

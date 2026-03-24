@@ -174,6 +174,7 @@ pub struct LookupKey {
 }
 
 impl LookupKey {
+    #[inline]
     pub fn new(user_key: &[u8], sequence: SequenceNumber) -> Self {
         let internal_len = user_key.len() + 8;
         assert!(

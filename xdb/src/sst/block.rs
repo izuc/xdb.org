@@ -502,6 +502,7 @@ impl<'a> BlockIterator<'a> {
     }
 
     /// Parse the entry at `self.current` and advance `current` past it.
+    #[inline]
     fn parse_next_entry(&mut self) {
         if self.current >= self.block.data_end() {
             self.valid = false;
@@ -574,6 +575,7 @@ impl<'a> BlockIterator<'a> {
     ///
     /// At restart points `shared` is always 0, so the full key is stored
     /// inline. We parse the header and compare the key bytes directly.
+    #[inline]
     fn compare_restart_key_with(
         &self,
         restart_index: usize,
