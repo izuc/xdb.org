@@ -252,6 +252,16 @@ impl VersionSet {
         loop {
             match reader.read_edit() {
                 Ok(Some(edit)) => {
+                    // Validate the comparator matches what we expect.
+                    if let Some(ref name) = edit.comparator_name {
+                        if name != "leveldb.BytewiseComparator" {
+                            return Err(Error::invalid_argument(format!(
+                                "MANIFEST comparator {:?} does not match \
+                                 expected \"leveldb.BytewiseComparator\"",
+                                name
+                            )));
+                        }
+                    }
                     version = version.apply(&edit);
                     if let Some(n) = edit.log_number {
                         log_number = Some(n);
