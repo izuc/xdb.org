@@ -43,14 +43,14 @@ impl BloomFilter {
         // Number of bits, with a minimum of 8 (1 byte).
         let num_bits = std::cmp::max(8, num_keys * self.bits_per_key);
         // Round up to whole bytes.
-        let num_bytes = (num_bits + 7) / 8;
+        let num_bytes = num_bits.div_ceil(8);
         let num_bits = num_bytes * 8;
 
         let mut data = vec![0u8; num_bytes];
 
         for key in keys {
             let mut h = bloom_hash(key);
-            let delta = (h >> 17) | (h << 15);
+            let delta = h.rotate_left(15);
             for _ in 0..self.k {
                 let bit_pos = (h as usize) % num_bits;
                 data[bit_pos / 8] |= 1 << (bit_pos % 8);
@@ -86,7 +86,7 @@ impl BloomFilter {
         let num_bits = bits_data.len() * 8;
 
         let mut h = bloom_hash(key);
-        let delta = (h >> 17) | (h << 15);
+        let delta = h.rotate_left(15);
         for _ in 0..k {
             let bit_pos = (h as usize) % num_bits;
             if bits_data[bit_pos / 8] & (1 << (bit_pos % 8)) == 0 {

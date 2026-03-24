@@ -218,7 +218,7 @@ impl VersionSet {
 
         // Read the CURRENT file to get the MANIFEST filename.
         let manifest_name = fs::read_to_string(&current_path)
-            .map_err(|e| Error::Io(e))?;
+            .map_err(Error::Io)?;
         let manifest_name = manifest_name.trim();
         if manifest_name.is_empty() {
             return Err(Error::corruption("empty CURRENT file"));

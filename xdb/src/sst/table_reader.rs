@@ -257,11 +257,7 @@ impl TableIterator {
             iter.next();
         }
 
-        if self.current_block_entries.is_empty() {
-            self.valid = false;
-        } else {
-            self.valid = true;
-        }
+        self.valid = !self.current_block_entries.is_empty();
     }
 }
 

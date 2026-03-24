@@ -99,7 +99,7 @@ impl SkipList {
     /// Generate a random height in [1, MAX_HEIGHT] with P = 1/BRANCHING_FACTOR.
     fn random_height() -> usize {
         let mut height = 1;
-        while height < MAX_HEIGHT && rand::random::<u32>() % BRANCHING_FACTOR == 0 {
+        while height < MAX_HEIGHT && rand::random::<u32>().is_multiple_of(BRANCHING_FACTOR) {
             height += 1;
         }
         height
@@ -172,6 +172,7 @@ impl SkipList {
 
         // Wire up from bottom to top so that concurrent readers always see a
         // consistent next chain at every level they can reach.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..height {
             unsafe {
                 // new_node.next[i] = prev[i].next[i]

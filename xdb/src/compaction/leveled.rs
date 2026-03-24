@@ -196,12 +196,11 @@ pub fn compact(
 
         // Drop deletion and range-deletion tombstones at the bottom level
         // where no older files could still reference the key.
-        if matches!(vt, Some(ValueType::Deletion) | Some(ValueType::RangeDeletion)) {
-            if target_level == options.num_levels - 1 {
+        if matches!(vt, Some(ValueType::Deletion) | Some(ValueType::RangeDeletion))
+            && target_level == options.num_levels - 1 {
                 merger.next();
                 continue;
             }
-        }
 
         // Start a new output file if needed.
         if current_builder.is_none() {

@@ -71,7 +71,7 @@ impl BlockBuilder {
     pub fn add(&mut self, key: &[u8], value: &[u8]) {
         assert!(!self.finished, "cannot add to a finished block");
 
-        let shared = if self.counter % self.restart_interval == 0 {
+        let shared = if self.counter.is_multiple_of(self.restart_interval) {
             // Restart point: reset prefix compression and record offset.
             self.restarts.push(self.data.len() as u32);
             0

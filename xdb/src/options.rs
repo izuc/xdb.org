@@ -8,8 +8,10 @@ use std::sync::Arc;
 
 /// Compression algorithm applied to SST data blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CompressionType {
     /// No compression (fastest writes/reads, largest files).
+    #[default]
     None,
     /// LZ4 compression (fast, moderate ratio).
     #[cfg(feature = "lz4")]
@@ -19,11 +21,6 @@ pub enum CompressionType {
     Zstd,
 }
 
-impl Default for CompressionType {
-    fn default() -> Self {
-        CompressionType::None
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Options (DB-wide)

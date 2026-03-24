@@ -606,18 +606,17 @@ impl Db {
 
         let file_size = builder.finish()?;
 
-        if file_size > 0 && smallest_key.is_some() {
+        if let (true, Some(sk)) = (file_size > 0, smallest_key) {
             let meta = FileMetaData {
                 number: file_number,
                 file_size,
-                smallest_key: InternalKey::from_bytes(smallest_key.unwrap()),
+                smallest_key: InternalKey::from_bytes(sk),
                 largest_key: InternalKey::from_bytes(largest_key),
             };
             let mut edit = VersionEdit::new();
             edit.set_log_number(state.versions.log_number());
             edit.add_file(0, meta);
             if let Err(e) = state.versions.log_and_apply(edit) {
-                // Clean up the orphaned SST file.
                 let _ = fs::remove_file(&sst_path);
                 return Err(e);
             }
@@ -825,11 +824,11 @@ impl Db {
 
         let file_size = builder.finish()?;
 
-        if file_size > 0 && smallest_key.is_some() {
+        if let (true, Some(sk)) = (file_size > 0, smallest_key) {
             let meta = FileMetaData {
                 number: file_number,
                 file_size,
-                smallest_key: InternalKey::from_bytes(smallest_key.unwrap()),
+                smallest_key: InternalKey::from_bytes(sk),
                 largest_key: InternalKey::from_bytes(largest_key),
             };
             let mut edit = VersionEdit::new();

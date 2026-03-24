@@ -63,8 +63,8 @@ impl WalReader {
 
         loop {
             // Refill the block buffer when we have consumed everything.
-            if self.block_offset >= self.block_buf.len() {
-                if !self.read_next_block()? {
+            if self.block_offset >= self.block_buf.len()
+                && !self.read_next_block()? {
                     // EOF
                     if in_fragmented_record {
                         return Err(Error::corruption(
@@ -73,7 +73,6 @@ impl WalReader {
                     }
                     return Ok(None);
                 }
-            }
 
             let remaining = self.block_buf.len() - self.block_offset;
 

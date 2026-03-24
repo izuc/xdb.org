@@ -170,7 +170,7 @@ impl LruShard {
                 let is_live = self
                     .map
                     .get(&front_key)
-                    .map_or(false, |n| n.generation == front_gen);
+                    .is_some_and(|n| n.generation == front_gen);
 
                 if is_live {
                     // Evict this entry.
@@ -197,7 +197,7 @@ impl LruShard {
             self.order.retain(|entry| {
                 self.map
                     .get(&entry.key)
-                    .map_or(false, |n| n.generation == entry.generation)
+                    .is_some_and(|n| n.generation == entry.generation)
             });
             self.stale_count = 0;
         }
