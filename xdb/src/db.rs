@@ -90,6 +90,13 @@ impl Db {
     pub fn open(options: Options, path: impl AsRef<Path>) -> Result<Arc<Self>> {
         let dbname = path.as_ref().to_path_buf();
 
+        // Validate options.
+        if options.num_levels < 2 {
+            return Err(Error::invalid_argument(
+                "num_levels must be at least 2 (L0 + one target level)",
+            ));
+        }
+
         // Check if the database already exists.
         let db_exists = dbname.join(CURRENT_FILE_NAME).exists();
 
