@@ -781,6 +781,7 @@ impl Db {
                     };
                     let mut edit = VersionEdit::new();
                     edit.set_log_number(log_number);
+                    edit.set_last_sequence(state.versions.last_sequence());
                     edit.add_file(0, meta);
                     if let Err(e) = state.versions.log_and_apply(edit) {
                         if let Err(e2) = fs::remove_file(&sst_path) {
@@ -792,13 +793,6 @@ impl Db {
                     }
                 } else if let Err(e) = fs::remove_file(&sst_path) {
                     log::warn!("failed to delete empty SST: {}", e);
-                }
-
-                // Delete the old WAL ONLY after the SST is durable in the
-                // MANIFEST. This prevents data loss on crash.
-                let old_wal_path = self.dbname.join(wal_file_name(log_number));
-                if let Err(e) = fs::remove_file(&old_wal_path) {
-                    log::warn!("failed to delete old WAL: {}", e);
                 }
 
                 self.sync_dir();
@@ -954,6 +948,7 @@ impl Db {
                     };
                     let mut edit = VersionEdit::new();
                     edit.set_log_number(log_number);
+                    edit.set_last_sequence(state.versions.last_sequence());
                     edit.add_file(0, meta);
                     if let Err(e) = state.versions.log_and_apply(edit) {
                         if let Err(e2) = fs::remove_file(&sst_path) {
@@ -964,12 +959,6 @@ impl Db {
                     }
                 } else if let Err(e) = fs::remove_file(&sst_path) {
                     log::warn!("failed to delete empty SST: {}", e);
-                }
-
-                // Delete old WAL only after SST is durable in MANIFEST.
-                let old_wal_path = self.dbname.join(wal_file_name(log_number));
-                if let Err(e) = fs::remove_file(&old_wal_path) {
-                    log::warn!("failed to delete old WAL: {}", e);
                 }
 
                 self.sync_dir();
@@ -1153,6 +1142,7 @@ impl Db {
             };
             let mut edit = VersionEdit::new();
             edit.set_log_number(versions.log_number());
+            edit.set_last_sequence(versions.last_sequence());
             edit.add_file(0, meta);
             versions.log_and_apply(edit)?;
         } else if let Err(e) = fs::remove_file(&sst_path) { log::warn!("failed to delete file: {}", e); }
