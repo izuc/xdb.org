@@ -96,61 +96,52 @@ pub(crate) struct ColumnFamilyMap {
 impl ColumnFamilyMap {
     /// Create a new map from a list of CF descriptors.
     ///
-    /// Panics if more than 255 column families are requested.
+    /// CF IDs are assigned deterministically: "default" always gets ID 0,
+    /// and all other CFs are sorted by name and assigned IDs 1, 2, 3, ...
+    /// This ensures the mapping is stable across reopens regardless of
+    /// the order descriptors are passed in.
+    ///
+    /// Panics if more than 256 column families are requested.
     pub fn new(descriptors: &[ColumnFamilyDescriptor]) -> Self {
+        // Collect unique names, ensuring "default" is present.
+        let mut names: Vec<String> = descriptors.iter()
+            .map(|d| d.name.clone())
+            .collect();
+        if !names.iter().any(|n| n == "default") {
+            names.push("default".to_string());
+        }
+        // Deduplicate.
+        names.sort();
+        names.dedup();
+
+        assert!(
+            names.len() <= 256,
+            "xdb supports at most 256 column families"
+        );
+
         let mut name_to_id = HashMap::new();
         let mut families = Vec::new();
 
-        // Ensure "default" is always ID 0.
-        let mut has_default = false;
+        // "default" always gets ID 0.
+        name_to_id.insert("default".to_string(), 0u8);
+        families.push(ColumnFamily {
+            name: "default".to_string(),
+            id: 0,
+        });
+
+        // All other CFs get IDs 1..N in sorted name order.
         let mut next_id: u8 = 0;
-
-        for desc in descriptors {
-            if desc.name == "default" {
-                has_default = true;
+        for name in &names {
+            if name == "default" {
+                continue;
             }
-        }
-
-        if has_default {
-            // Assign IDs in descriptor order, with "default" getting 0.
-            for desc in descriptors {
-                let id = if desc.name == "default" {
-                    0
-                } else {
-                    next_id += 1;
-                    if next_id == 0 {
-                        // Wrapped around — too many CFs.
-                        next_id = 255;
-                    }
-                    next_id
-                };
-                name_to_id.insert(desc.name.clone(), id);
-                families.push(ColumnFamily {
-                    name: desc.name.clone(),
-                    id,
-                });
-            }
-        } else {
-            // No explicit "default" — add it as ID 0.
-            name_to_id.insert("default".to_string(), 0);
+            next_id += 1;
+            name_to_id.insert(name.clone(), next_id);
             families.push(ColumnFamily {
-                name: "default".to_string(),
-                id: 0,
+                name: name.clone(),
+                id: next_id,
             });
-            for desc in descriptors {
-                next_id += 1;
-                name_to_id.insert(desc.name.clone(), next_id);
-                families.push(ColumnFamily {
-                    name: desc.name.clone(),
-                    id: next_id,
-                });
-            }
         }
-
-        assert!(
-            families.len() <= 256,
-            "xdb supports at most 256 column families"
-        );
 
         ColumnFamilyMap {
             name_to_id,

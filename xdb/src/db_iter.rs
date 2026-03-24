@@ -26,7 +26,10 @@ pub struct DbIterator {
     range_tombstones: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)>,
     /// Optional upper bound (exclusive). The iterator automatically becomes
     /// invalid when advancing past this key.
-    upper_bound: Option<Vec<u8>>,
+    pub(crate) upper_bound: Option<Vec<u8>>,
+    /// Number of bytes to strip from the front of returned keys.
+    /// Used by column family iterators to hide the CF prefix byte.
+    key_prefix_len: usize,
 }
 
 impl DbIterator {
@@ -40,6 +43,7 @@ impl DbIterator {
             valid: false,
             range_tombstones: Vec::new(),
             upper_bound: None,
+            key_prefix_len: 0,
         }
     }
 
@@ -57,6 +61,7 @@ impl DbIterator {
             valid: false,
             range_tombstones,
             upper_bound: None,
+            key_prefix_len: 0,
         }
     }
 
@@ -171,9 +176,19 @@ impl DbIterator {
         self.find_prev_user_entry();
     }
 
+    /// Set the number of bytes to strip from the front of returned keys.
+    /// Used internally by column family iterators.
+    pub(crate) fn set_key_prefix_len(&mut self, len: usize) {
+        self.key_prefix_len = len;
+    }
+
     pub fn key(&self) -> &[u8] {
         assert!(self.valid, "DbIterator::key() called on invalid iterator");
-        &self.saved_key
+        if self.key_prefix_len > 0 && self.saved_key.len() > self.key_prefix_len {
+            &self.saved_key[self.key_prefix_len..]
+        } else {
+            &self.saved_key
+        }
     }
 
     pub fn value(&self) -> &[u8] {

@@ -294,14 +294,16 @@ impl Db {
     /// Create a prefix iterator within a specific column family.
     ///
     /// Scans all keys starting with `prefix` in the given column family.
-    /// Keys returned by the iterator have the CF prefix stripped.
+    /// Keys returned by the iterator have the CF prefix byte stripped.
     pub fn prefix_iterator_cf(
         &self,
         cf: &crate::column_family::ColumnFamily,
         prefix: impl AsRef<[u8]>,
     ) -> DbIterator {
         let full_prefix = cf.prefixed_key(prefix.as_ref());
-        self.prefix_iterator(&full_prefix)
+        let mut iter = self.prefix_iterator(&full_prefix);
+        iter.set_key_prefix_len(1);
+        iter
     }
 
     /// Create an iterator within a specific column family using the given mode.
@@ -324,6 +326,9 @@ impl Db {
         if let Some(ref end) = cf_end {
             iter.set_upper_bound(end.clone());
         }
+
+        // Strip the CF prefix byte from returned keys.
+        iter.set_key_prefix_len(1);
 
         match mode {
             IteratorMode::Start => {
