@@ -185,6 +185,14 @@ impl TableCache {
         let to_remove = (entries.len() / 4).max(1);
         for &(file_num, _) in entries.iter().take(to_remove) {
             inner.readers.remove(&file_num);
+            // Clear the fast direct-mapped slot if it holds this file,
+            // otherwise stale readers survive eviction.
+            let slot = (file_num as usize) % FAST_SLOTS;
+            if let Some((num, _)) = &inner.fast[slot] {
+                if *num == file_num {
+                    inner.fast[slot] = None;
+                }
+            }
         }
     }
 }

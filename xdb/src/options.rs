@@ -3,6 +3,25 @@
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
+// WAL Recovery Mode
+// ---------------------------------------------------------------------------
+
+/// How to handle WAL corruption during database recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WalRecoveryMode {
+    /// Tolerate corruption at the tail of the WAL (truncated write from crash).
+    /// This is the default and matches LevelDB/RocksDB behavior.
+    #[default]
+    TolerateCorruptedTailRecords,
+    /// Fail if ANY corruption is detected in the WAL, even at the tail.
+    /// Use for blockchain backends that require absolute consistency.
+    AbsoluteConsistency,
+    /// Skip any corrupted records (even in the middle of the WAL) and
+    /// continue recovery. May lose data but allows the database to open.
+    SkipAnyCorruptedRecords,
+}
+
+// ---------------------------------------------------------------------------
 // Compression
 // ---------------------------------------------------------------------------
 
@@ -104,6 +123,10 @@ pub struct Options {
     /// If true, every write is fsynced to the WAL before returning.
     /// Default: false (rely on OS page cache for batching).
     pub sync_writes: bool,
+
+    /// How to handle WAL corruption during database recovery.
+    /// Default: `TolerateCorruptedTailRecords`.
+    pub wal_recovery_mode: WalRecoveryMode,
 }
 
 impl Default for Options {
@@ -136,6 +159,8 @@ impl Default for Options {
             rate_limiter: None,
 
             sync_writes: false,
+
+            wal_recovery_mode: WalRecoveryMode::default(),
         }
     }
 }

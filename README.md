@@ -28,6 +28,10 @@ Rust application with zero FFI overhead.
 - **Bloom filter existence check** -- `key_may_exist()` without reading value
 - **Database properties** -- `get_property()` for monitoring (L0 count, sizes, etc.)
 - **Rate limiter** -- token-bucket I/O throttling for background work
+- **WAL recovery modes** -- tolerate tail corruption, absolute consistency, or skip corrupted records
+- **Checkpoints** -- instant point-in-time copies via hard-linked SST files
+- **Backup engine** -- create, restore, list, and delete full database backups
+- **RepairDB** -- rebuild MANIFEST from valid SST files after corruption
 - **Statistics** -- lock-free atomic counters for observability
 - **File locking** -- exclusive process lock via flock/LockFileEx
 - **MANIFEST rotation** -- automatic rotation at 4 MiB for fast recovery
@@ -96,9 +100,20 @@ println!("{}", db.stats());
 // Manual compaction.
 db.compact_range(None, None).unwrap();
 
+// Checkpoint (instant point-in-time copy).
+db.checkpoint("/tmp/my_xdb_checkpoint").unwrap();
+
+// Backup engine.
+let engine = xdb::BackupEngine::new("/tmp/my_xdb_backups").unwrap();
+let backup = engine.create_backup(&db).unwrap();
+// engine.restore(backup.id, "/tmp/restored_db").unwrap();
+
 // Flush and close.
 db.flush().unwrap();
 db.close().unwrap();
+
+// Repair a corrupted database.
+// Db::repair(Options::default(), "/tmp/broken_db").unwrap();
 
 // Destroy database (delete all files).
 // Db::destroy("/tmp/my_xdb").unwrap();
@@ -163,12 +178,20 @@ cargo bench -p xdb --bench comparison      # xdb vs RocksDB
 | `db.release_snapshot(snap)` | Release a snapshot |
 | `db.get_property(name)` | Query internal stats by name |
 | `db.stats()` | Live statistics counters |
+| `db.checkpoint(path)` | Create a point-in-time copy via hard links |
+| `Db::repair(opts, path)` | Rebuild MANIFEST from valid SST files |
 
 **Iterator methods:** `seek_to_first()`, `seek_to_last()`, `seek(target)`,
 `next()`, `prev()`, `key()`, `value()`, `valid()`,
 `set_upper_bound(key)`, `set_lower_bound(key)`.
 
 **WriteOptions:** `sync` (fsync WAL), `disable_wal` (skip WAL for ephemeral data).
+
+**WalRecoveryMode:** `TolerateCorruptedTailRecords` (default), `AbsoluteConsistency`,
+`SkipAnyCorruptedRecords`.
+
+**BackupEngine:** `new(dir)`, `create_backup(db)`, `restore(id, path)`,
+`list_backups()`, `delete_backup(id)`.
 
 **Properties:** `xdb.num-files-at-levelN`, `xdb.level-summary`, `xdb.total-sst-size`,
 `xdb.mem-usage`, `xdb.last-sequence`, `xdb.num-snapshots`, `xdb.num-entries`,

@@ -24,7 +24,7 @@ use crate::db_iter::DbIterator;
 use crate::error::{Error, Result};
 use crate::iterator::{MergingIterator, XdbIterator};
 use crate::memtable::MemTable;
-use crate::options::{Options, WriteOptions};
+use crate::options::{Options, WalRecoveryMode, WriteOptions};
 use crate::snapshot::{Snapshot, SnapshotList};
 use crate::sst::TableBuilder;
 use crate::stats::Statistics;
@@ -159,7 +159,7 @@ impl Db {
             let mut max_sequence = versions.last_sequence();
 
             for (_num, wal_path) in &wal_files {
-                Self::replay_wal(wal_path, &recovery_mem, &mut max_sequence)?;
+                Self::replay_wal(wal_path, &recovery_mem, &mut max_sequence, opts.wal_recovery_mode)?;
             }
             versions.set_last_sequence(max_sequence);
 
@@ -717,6 +717,8 @@ impl Db {
                 let _ = state.versions.new_file_number();
             }
 
+            let oldest_snap = self.snapshots.oldest_sequence();
+
             // Release lock during I/O.
             drop(state);
 
@@ -726,6 +728,7 @@ impl Db {
                 &mut comp_state,
                 &self.options,
                 &mut next_file,
+                oldest_snap,
             )?;
 
             // Re-acquire lock to apply edit.
@@ -772,6 +775,11 @@ impl Db {
         }
 
         let mut state = self.state.write();
+        // Flush any pending immutable memtable first so it is not lost
+        // when we overwrite state.imm below.
+        if state.imm.is_some() {
+            self.do_flush(&mut state)?;
+        }
         if !state.mem.is_empty() {
             let old_mem = std::mem::replace(&mut state.mem, Arc::new(MemTable::new()));
             state.imm = Some(old_mem);
@@ -1206,6 +1214,11 @@ impl Db {
                 self.sync_dir();
                 Statistics::record(&self.stats.flushes, 1);
 
+                // Clean up old WAL files that are no longer needed.
+                // After the flush, the MANIFEST records log_number as the
+                // current WAL, so any older WALs are safe to delete.
+                self.cleanup_old_wals(log_number);
+
                 if state.versions.pick_compaction().is_some()
                     && !state.bg_compaction_scheduled
                 {
@@ -1221,6 +1234,24 @@ impl Db {
                 }
                 state.imm = Some(imm);
                 Err(e)
+            }
+        }
+    }
+
+    /// Delete WAL files older than the given log number.
+    fn cleanup_old_wals(&self, current_log_number: FileNumber) {
+        if let Ok(entries) = fs::read_dir(&self.dbname) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some(num_str) = name.strip_suffix(".log") {
+                    if let Ok(num) = num_str.parse::<u64>() {
+                        if num < current_log_number {
+                            if let Err(e) = fs::remove_file(entry.path()) {
+                                log::warn!("failed to delete old WAL {}: {}", name, e);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1275,11 +1306,13 @@ impl Db {
             };
 
             // Step 2: Compaction I/O — no lock held.
+            let oldest_snap = self.snapshots.oldest_sequence();
             let edit = compaction::compact(
                 &self.dbname,
                 &mut comp_state,
                 &self.options,
                 &mut next_file,
+                oldest_snap,
             )?;
 
             Statistics::record(&self.stats.compactions, 1);
@@ -1420,11 +1453,30 @@ impl Db {
         wal_path: &Path,
         mem: &MemTable,
         max_sequence: &mut SequenceNumber,
+        wal_recovery_mode: WalRecoveryMode,
     ) -> Result<()> {
         let file = fs::File::open(wal_path)?;
         let mut reader = crate::wal::WalReader::new(file);
 
-        while let Some(data) = reader.read_record()? {
+        loop {
+            let data = match reader.read_record() {
+                Ok(Some(data)) => data,
+                Ok(None) => break, // clean EOF
+                Err(e) => match wal_recovery_mode {
+                    WalRecoveryMode::TolerateCorruptedTailRecords => {
+                        log::warn!("ignoring corrupted WAL tail: {}", e);
+                        break; // treat as EOF
+                    }
+                    WalRecoveryMode::AbsoluteConsistency => {
+                        return Err(e); // fail hard
+                    }
+                    WalRecoveryMode::SkipAnyCorruptedRecords => {
+                        log::warn!("skipping corrupted WAL record: {}", e);
+                        continue; // skip and try next
+                    }
+                },
+            };
+
             if data.len() < 12 {
                 continue;
             }
@@ -1533,6 +1585,206 @@ impl Db {
             }
         }
 
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkpoint
+    // -----------------------------------------------------------------------
+
+    /// Create a lightweight checkpoint of the database using hard links.
+    ///
+    /// The checkpoint is a consistent snapshot that shares SST files with
+    /// the original database via hard links (no data copying). Only the
+    /// MANIFEST and CURRENT files are copied. WAL files are NOT included
+    /// (the checkpoint represents the last flushed state).
+    ///
+    /// The database must be open. The checkpoint directory must not exist.
+    pub fn checkpoint(&self, checkpoint_path: impl AsRef<Path>) -> Result<()> {
+        let checkpoint_path = checkpoint_path.as_ref();
+        if checkpoint_path.exists() {
+            return Err(Error::invalid_argument(
+                "checkpoint directory already exists",
+            ));
+        }
+
+        // Flush to ensure all data is in SSTs.
+        self.flush()?;
+
+        let state = self.state.read();
+        let version = state.versions.current();
+
+        fs::create_dir_all(checkpoint_path)?;
+
+        // Hard-link all SST files.
+        for level in 0..version.num_levels {
+            for file_meta in version.files_at_level(level) {
+                let src = self.dbname.join(sst_file_name(file_meta.number));
+                let dst = checkpoint_path.join(sst_file_name(file_meta.number));
+                fs::hard_link(&src, &dst).or_else(|_| fs::copy(&src, &dst).map(|_| ()))?;
+            }
+        }
+
+        // Copy MANIFEST (don't hard-link -- it may be written to later).
+        let manifest_name = manifest_file_name(state.versions.manifest_file_number());
+        let src = self.dbname.join(&manifest_name);
+        let dst = checkpoint_path.join(&manifest_name);
+        fs::copy(&src, &dst)?;
+
+        // Write CURRENT with fsync for crash safety.
+        {
+            use std::io::Write;
+            let current_path = checkpoint_path.join(CURRENT_FILE_NAME);
+            let mut f = fs::File::create(&current_path)?;
+            f.write_all(format!("{}\n", manifest_name).as_bytes())?;
+            f.sync_all()?;
+        }
+
+        // Create empty LOCK file.
+        fs::File::create(checkpoint_path.join(LOCK_FILE_NAME))?;
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // RepairDB
+    // -----------------------------------------------------------------------
+
+    /// Attempt to repair a corrupted database.
+    ///
+    /// Scans the database directory for valid SST files, reconstructs a
+    /// new MANIFEST from their metadata, and creates a fresh WAL. Data in
+    /// corrupted SST files or WAL files is lost.
+    ///
+    /// The database must NOT be open.
+    pub fn repair(options: Options, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(Error::invalid_argument("database path does not exist"));
+        }
+
+        let mut recovered_files: Vec<(u64, u64, Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut max_sequence: SequenceNumber = 0;
+
+        // Scan for valid SST files.
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(num_str) = name.strip_suffix(".sst") {
+                if let Ok(num) = num_str.parse::<u64>() {
+                    let file_path = entry.path();
+                    match fs::File::open(&file_path) {
+                        Ok(f) => {
+                            let file_size = f.metadata()?.len();
+                            match crate::sst::TableReader::open(f, file_size, options.clone()) {
+                                Ok(reader) => {
+                                    let entries = match reader.iter_entries() {
+                                        Ok(e) => e,
+                                        Err(e) => {
+                                            log::warn!(
+                                                "repair: skipping SST {} (cannot iterate): {}",
+                                                name, e
+                                            );
+                                            continue;
+                                        }
+                                    };
+                                    // Track the maximum sequence number from actual
+                                    // internal keys so new writes don't reuse
+                                    // sequence numbers that already exist in SSTs.
+                                    for (k, _) in &entries {
+                                        let tag = extract_tag(k);
+                                        let seq = tag_sequence(tag);
+                                        if seq > max_sequence {
+                                            max_sequence = seq;
+                                        }
+                                    }
+                                    if let (Some(first), Some(last)) =
+                                        (entries.first(), entries.last())
+                                    {
+                                        recovered_files.push((
+                                            num,
+                                            file_size,
+                                            first.0.clone(),
+                                            last.0.clone(),
+                                        ));
+                                        log::info!(
+                                            "repair: recovered SST file {} ({} entries)",
+                                            name,
+                                            entries.len()
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("repair: skipping corrupt SST {}: {}", name, e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("repair: cannot open {}: {}", name, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Find the max file number for next_file_number.
+        let max_file_num = recovered_files
+            .iter()
+            .map(|(n, _, _, _)| *n)
+            .max()
+            .unwrap_or(0);
+
+        // Build a VersionEdit with all recovered files at L0.
+        let mut edit = VersionEdit::new();
+        edit.set_comparator_name("leveldb.BytewiseComparator".to_string());
+        edit.set_log_number(0);
+        edit.set_next_file_number(max_file_num + 10);
+        edit.set_last_sequence(max_sequence);
+
+        for (num, file_size, smallest, largest) in &recovered_files {
+            edit.add_file(
+                0,
+                FileMetaData {
+                    number: *num,
+                    file_size: *file_size,
+                    smallest_key: InternalKey::from_bytes(smallest.clone()),
+                    largest_key: InternalKey::from_bytes(largest.clone()),
+                },
+            );
+        }
+
+        // Delete old MANIFEST and WAL files.
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("MANIFEST-") || name.ends_with(".log") || name == "CURRENT" {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+
+        // Write new MANIFEST.
+        let manifest_number = max_file_num + 1;
+        let manifest_name_str = manifest_file_name(manifest_number);
+        let manifest_path = path.join(&manifest_name_str);
+        let file = fs::File::create(&manifest_path)?;
+        let mut writer = crate::version::ManifestWriter::new(file);
+        writer.add_edit(&edit)?;
+
+        // Write CURRENT atomically.
+        use std::io::Write;
+        let current_path = path.join(CURRENT_FILE_NAME);
+        let tmp_path = path.join("CURRENT.tmp");
+        let mut f = fs::File::create(&tmp_path)?;
+        f.write_all(format!("{}\n", manifest_name_str).as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp_path, &current_path)?;
+
+        log::info!(
+            "repair: recovered {} SST files, new MANIFEST at {}",
+            recovered_files.len(),
+            manifest_name_str
+        );
         Ok(())
     }
 }

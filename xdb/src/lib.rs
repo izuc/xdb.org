@@ -39,12 +39,14 @@ pub mod db_iter;
 pub mod stats;
 pub mod compaction;
 pub mod rate_limiter;
+pub mod backup;
 pub mod db;
 
 // Re-export the main public API at crate root.
 pub use db::Db;
 pub use error::{Error, Result};
-pub use options::{Options, ReadOptions, WriteOptions};
+pub use options::{Options, ReadOptions, WalRecoveryMode, WriteOptions};
+pub use backup::{BackupEngine, BackupInfo};
 pub use batch::WriteBatch;
 pub use snapshot::Snapshot;
 pub use db_iter::DbIterator;

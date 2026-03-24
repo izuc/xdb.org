@@ -103,6 +103,7 @@ pub fn compact(
     state: &mut CompactionState,
     options: &Options,
     next_file_number: &mut FileNumber,
+    oldest_snapshot_seq: Option<SequenceNumber>,
 ) -> Result<VersionEdit> {
     let mut edit = VersionEdit::new();
 
@@ -140,6 +141,11 @@ pub fn compact(
     let mut current_largest: Vec<u8> = Vec::new();
     let target_level = state.level + 1;
     let mut last_user_key: Vec<u8> = Vec::new();
+    // The smallest sequence number still needed by an active snapshot.
+    // Versions with seq >= this value must be preserved. If no snapshots
+    // are active, all older versions can be safely dropped.
+    let preserve_below = oldest_snapshot_seq.unwrap_or(SequenceNumber::MAX);
+    let mut last_key_visible_to_snapshot = false;
 
     while merger.valid() {
         let key = merger.key();
@@ -156,12 +162,22 @@ pub fn compact(
         let is_range_tombstone = vt == Some(ValueType::RangeDeletion);
 
         if !is_range_tombstone {
-            // Skip duplicate user keys: keep only the newest (first encountered).
             if user_key == last_user_key.as_slice() && !last_user_key.is_empty() {
-                merger.next();
-                continue;
+                // For a duplicate user key: keep the newest version, but
+                // also preserve any version that an active snapshot might
+                // need to see. A version is safe to drop only if:
+                // 1. We already emitted a newer version of this key, AND
+                // 2. This version's sequence is below the oldest snapshot.
+                if !last_key_visible_to_snapshot || seq < preserve_below {
+                    merger.next();
+                    continue;
+                }
+            } else {
+                // New user key — always keep the first (newest) version.
+                last_user_key = user_key.to_vec();
+                // Track whether any active snapshot could read older versions.
+                last_key_visible_to_snapshot = seq >= preserve_below;
             }
-            last_user_key = user_key.to_vec();
 
             // Check if this key is covered by a range tombstone.
             // Uses binary search on the sorted tombstone list to find
@@ -188,9 +204,11 @@ pub fn compact(
         }
 
         // Drop deletion and range-deletion tombstones at the bottom level
-        // where no older files could still reference the key.
+        // where no older files could still reference the key, BUT only if
+        // no active snapshot could still see through the tombstone.
         if matches!(vt, Some(ValueType::Deletion) | Some(ValueType::RangeDeletion))
             && target_level == options.num_levels - 1
+            && seq < preserve_below
         {
             merger.next();
             continue;

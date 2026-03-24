@@ -33,9 +33,10 @@ embedded directly in any Rust application with zero FFI overhead.
    - [Block Cache](#block-cache)
    - [WriteBatch](#writebatch)
 10. [Module Reference](#module-reference)
-11. [Comparison with RocksDB](#comparison-with-rocksdb)
-12. [Known Limitations](#known-limitations)
-13. [Building and Testing](#building-and-testing)
+11. [Operational Features](#operational-features)
+12. [Comparison with RocksDB](#comparison-with-rocksdb)
+13. [Known Limitations](#known-limitations)
+14. [Building and Testing](#building-and-testing)
 
 ---
 
@@ -55,7 +56,7 @@ into ~13,000 lines of idiomatic, safe Rust.
 | **Fast** | O(1) direct-mapped block cache, zero-copy block reads, stack-allocated lookup keys, lock-free concurrent reads via RwLock + atomic skip list. Faster than RocksDB on both reads and writes. |
 | **Embeddable** | Pure Rust crate with `cargo add xdb`. No C/C++ toolchain, no FFI, no build.rs complexity. |
 | **Safe** | All public APIs are safe Rust. Unsafe code is limited to the skip list internals (atomic pointer manipulation) with a safe wrapper. |
-| **Correct** | CRC32 checksums on WAL records and SST blocks, crash-safe MANIFEST updates, WAL replay on recovery. 214 tests including 45 stress tests for data integrity, crash recovery, compaction, snapshots, and concurrency. |
+| **Correct** | CRC32 checksums on WAL records and SST blocks, crash-safe MANIFEST updates, WAL replay on recovery. 217 tests including 45 stress tests for data integrity, crash recovery, compaction, snapshots, and concurrency. |
 
 ### What xdb Implements
 
@@ -64,7 +65,7 @@ into ~13,000 lines of idiomatic, safe Rust.
 - Write-Ahead Log for crash durability with CRC32 checksums
 - Lock-free SkipList MemTable (fixed-size node array, xorshift PRNG)
 - SST files with prefix-compressed blocks, bloom filters, and index blocks
-- Leveled compaction with background thread (releases lock during I/O)
+- Leveled compaction with background thread (releases lock during I/O, snapshot-aware)
 - MANIFEST-based version tracking with crash-tolerant recovery
 - Snapshots / MVCC (point-in-time consistent reads)
 - Forward and reverse iterators with snapshot isolation and upper/lower bounds
@@ -80,6 +81,10 @@ into ~13,000 lines of idiomatic, safe Rust.
 - Stack-allocated LookupKey (256-byte inline buffer, no heap for typical keys)
 - RwLock for concurrent readers (read path never blocks other readers)
 - Background flush and compaction with graceful shutdown
+- WAL recovery modes (tolerate tail corruption, absolute consistency, skip all corrupted)
+- Checkpoints (hard-linked point-in-time copies)
+- Backup engine (create, restore, list, delete full backups)
+- RepairDB (rebuild MANIFEST from valid SST files)
 - Rate limiter (token bucket for background I/O throttling)
 - Statistics counters (atomic, lock-free observability)
 - Fuzz targets, example programs, Criterion benchmarks
@@ -241,6 +246,8 @@ cheaply cloned and shared across threads.
 | `release_snapshot` | `fn release_snapshot(&self, snap: &Snapshot)` | Release a snapshot. |
 | `get_property` | `fn get_property(&self, name: &str) -> Option<String>` | Query internal stats by name. |
 | `stats` | `fn stats(&self) -> &Statistics` | Get live statistics counters. |
+| `checkpoint` | `fn checkpoint(&self, path: impl AsRef<Path>) -> Result<()>` | Create a point-in-time copy via hard links. |
+| `repair` | `fn repair(options: Options, path: impl AsRef<Path>) -> Result<()>` | Rebuild MANIFEST from valid SST files. |
 
 ### `WriteBatch`
 
@@ -305,6 +312,7 @@ let opts = Options::default()
 | `block_cache_capacity` | 8 MiB | Global block cache size (0 = disabled). |
 | `max_open_files` | 1000 | Max SST files kept open in the table cache. |
 | `sync_writes` | `false` | Fsync the WAL on every write. |
+| `wal_recovery_mode` | `TolerateCorruptedTailRecords` | How to handle WAL corruption during recovery. |
 | `rate_limiter` | `None` | Optional token-bucket rate limiter for background I/O. |
 
 ### WriteOptions
@@ -438,8 +446,14 @@ Background compaction merges files to control read amplification:
 2. Select input files and find overlapping files in level+1.
 3. Stream-merge via MergingIterator (reads blocks on demand, not all into memory).
 4. Deduplicate user keys (newest wins), skip range-deleted entries, drop
-   tombstones at bottom level.
+   tombstones at bottom level only when no active snapshot references them.
 5. Write output files, apply VersionEdit, delete input files.
+6. Clean up old WAL files that are no longer needed for recovery.
+
+Compaction is **snapshot-aware**: the oldest active snapshot's sequence number
+is passed to the compaction routine, and older versions of keys are preserved
+if any snapshot might still read them. Tombstones at the bottom level are only
+dropped when their sequence is below the oldest snapshot.
 
 Compaction releases the state lock during I/O. Checks `shutting_down` between
 rounds for graceful shutdown. Re-triggers if work remains after 32 rounds.
@@ -618,16 +632,89 @@ xdb/src/
 | Lines of code | ~415,000 | ~13,000 |
 | Random read latency | ~950 ns | **~600 ns** |
 | Sequential write throughput | 23K ops/s | **40K ops/s** |
-| Compaction strategies | Leveled, Universal, FIFO | Leveled |
+| Compaction strategies | Leveled, Universal, FIFO | Leveled (snapshot-aware) |
 | Compression | 7 algorithms | LZ4, Zstd (feature flags) |
 | Range deletes | Yes | Yes |
 | Snapshots / MVCC | Yes | Yes |
 | Reverse iteration | Yes | Yes |
+| WAL recovery modes | Yes | Yes |
+| Checkpoints | Yes | Yes |
+| Backup engine | Yes | Yes |
+| RepairDB | Yes | Yes |
 | Column families | Yes | No |
 | Transactions | Full ACID | No |
 | Merge operators | Yes | No |
 | Block cache | LRU + HyperClockCache | O(1) direct-mapped + sharded LRU |
 | Platform abstraction | 24K lines | std::fs (zero lines) |
+
+---
+
+## Operational Features
+
+### WAL Recovery Modes
+
+Control how the database handles WAL corruption during recovery via `Options::wal_recovery_mode`:
+
+| Mode | Behavior |
+|------|----------|
+| `TolerateCorruptedTailRecords` | (Default) Ignore corruption at the WAL tail — a truncated write from a crash. Matches LevelDB/RocksDB behavior. |
+| `AbsoluteConsistency` | Fail if ANY corruption is detected, even at the tail. For blockchain backends requiring absolute consistency. |
+| `SkipAnyCorruptedRecords` | Skip corrupted records anywhere in the WAL and continue. May lose data but guarantees the database can open. |
+
+### Checkpoints
+
+`db.checkpoint(path)` creates a point-in-time copy of the database:
+
+- Flushes the memtable to disk first
+- Hard-links all SST files (instant, no extra disk space)
+- Falls back to file copy if hard links aren't supported (e.g., cross-filesystem)
+- Copies the MANIFEST (not hard-linked, since the source may still be written to)
+- Writes a CURRENT pointer (fsynced for crash safety) and empty LOCK file
+- The checkpoint can be opened independently as a read-only or read-write database
+
+### Backup Engine
+
+`BackupEngine` provides managed backup/restore operations:
+
+```rust
+use xdb::BackupEngine;
+
+let engine = BackupEngine::new("/backups/my_xdb").unwrap();
+
+// Create a backup (uses checkpoint internally).
+let info = engine.create_backup(&db).unwrap();
+println!("Backup {} at {:?}", info.id, info.path);
+
+// List all backups.
+let backups = engine.list_backups().unwrap();
+
+// Restore backup #1 to a new path.
+engine.restore(1, "/tmp/restored_db").unwrap();
+
+// Delete a backup.
+engine.delete_backup(1).unwrap();
+```
+
+Backups are numbered sequentially (`backup-000001`, `backup-000002`, ...). Each backup is a full copy (SSTs are file-copied, not hard-linked) so backups are independent of the source database.
+
+### RepairDB
+
+`Db::repair(options, path)` attempts to recover a corrupted database:
+
+1. Scans the database directory for valid `.sst` files
+2. Opens each SST and reads its key range and sequence number metadata
+3. Skips any SST files that fail to open or iterate (corrupted)
+4. Computes the correct `last_sequence` from actual internal keys (not file numbers)
+5. Deletes old MANIFEST, CURRENT, and WAL files
+6. Writes a new MANIFEST (fsynced) with all recovered SSTs placed at L0
+7. Writes a new CURRENT pointer (fsynced, atomic rename)
+
+Data in corrupted SST files or WAL files that hadn't been flushed is lost. After repair, opening the database will trigger compaction to move the L0 files into their proper levels.
+
+```rust
+use xdb::{Db, Options};
+Db::repair(Options::default(), "/path/to/broken_db").unwrap();
+```
 
 ---
 
@@ -638,8 +725,9 @@ xdb/src/
   by `make_room_for_write`) release the lock during I/O.
 - **WAL sync under state lock.** `sync_writes=true` blocks all threads during
   fsync. Group commit (WAL in separate Mutex) is a future optimization.
-- **No exclusive file locking.** The LOCK file exists but `flock`/`LockFileEx`
-  isn't called. Two processes could corrupt the DB if opened concurrently.
+- **Single-process access.** Exclusive file locking via `flock`/`LockFileEx`
+  prevents two processes from opening the same DB, but the database is not
+  designed for multi-process access patterns.
 - **Block seek uses bytewise comparison.** For the rare case where the same
   user key spans 16+ entries across restart points, the binary search may not
   find the optimal start. The linear scan compensates.
