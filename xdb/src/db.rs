@@ -90,6 +90,15 @@ impl Db {
     pub fn open(options: Options, path: impl AsRef<Path>) -> Result<Arc<Self>> {
         let dbname = path.as_ref().to_path_buf();
 
+        // Check if the database already exists.
+        let db_exists = dbname.join(CURRENT_FILE_NAME).exists();
+
+        if options.error_if_exists && db_exists {
+            return Err(Error::invalid_argument(format!(
+                "database {:?} already exists and error_if_exists is true",
+                dbname
+            )));
+        }
         if options.create_if_missing {
             fs::create_dir_all(&dbname)?;
         }
@@ -606,6 +615,11 @@ impl Db {
 
         let file_size = builder.finish()?;
 
+        // Throttle flush I/O via rate limiter if configured.
+        if let Some(ref limiter) = self.options.rate_limiter {
+            limiter.request(file_size as usize);
+        }
+
         if let (true, Some(sk)) = (file_size > 0, smallest_key) {
             let meta = FileMetaData {
                 number: file_number,
@@ -758,6 +772,14 @@ impl Db {
             )?;
 
             Statistics::record(&self.stats.compactions, 1);
+
+            // Throttle compaction I/O via rate limiter if configured.
+            if let Some(ref limiter) = self.options.rate_limiter {
+                let bytes_written: u64 = comp_state.output_files.iter()
+                    .map(|f| f.file_size)
+                    .sum();
+                limiter.request(bytes_written as usize);
+            }
 
             // Step 3: Apply the edit under lock.
             let apply_result = {
