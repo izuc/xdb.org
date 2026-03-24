@@ -82,6 +82,7 @@ into ~13,000 lines of idiomatic, safe Rust.
 - Stack-allocated LookupKey (256-byte inline buffer, no heap for typical keys)
 - RwLock for concurrent readers (read path never blocks other readers)
 - Background flush and compaction with graceful shutdown
+- Column families (RocksDB-compatible API, prefix-based namespacing, up to 256 families)
 - WAL recovery modes (tolerate tail corruption, absolute consistency, skip all corrupted)
 - Checkpoints (hard-linked point-in-time copies)
 - Backup engine (create, restore, list, delete full backups)
@@ -645,7 +646,7 @@ xdb/src/
 | Checkpoints | Yes | Yes |
 | Backup engine | Yes | Yes |
 | RepairDB | Yes | Yes |
-| Column families | Yes | No |
+| Column families | Yes | Yes (prefix-based, up to 256) |
 | Transactions | Full ACID | No |
 | Merge operators | Yes | No |
 | Block cache | LRU + HyperClockCache | O(1) direct-mapped + sharded LRU |
@@ -724,28 +725,28 @@ Db::repair(Options::default(), "/path/to/broken_db").unwrap();
 
 ## ZIPP Blockchain Compatibility
 
-xdb provides all the storage primitives needed to serve as a RocksDB replacement
-for the ZIPP blockchain. ZIPP's `StorageBackend` trait maps to xdb as follows:
+xdb is a drop-in RocksDB replacement for the ZIPP blockchain. The column
+family API matches RocksDB 1:1, so the `zipp-storage` crate can switch from
+`rocksdb::` to `xdb::` with minimal changes:
 
-| ZIPP `StorageBackend` method | xdb implementation |
-|------------------------------|-------------------|
-| `get(table, key)` | `db.get(table_key)` with prefixed key |
-| `put(table, key, value)` | `db.put(table_key, value)` with prefixed key |
-| `delete(table, key)` | `db.delete(table_key)` with prefixed key |
-| `exists(table, key)` | `db.exists(table_key)` |
-| `scan_prefix(table, prefix)` | `db.prefix_iterator(table_prefix)` |
-| `scan_prefix_limit(table, prefix, limit)` | `db.prefix_iterator(table_prefix)` + `.take(limit)` |
-| `scan_prefix_reverse_limit(table, prefix, limit)` | `seek_for_prev()` + `prev()` loop |
-| `batch_write(ops)` | `WriteBatch` with prefixed keys |
+| RocksDB call | xdb equivalent |
+|--------------|----------------|
+| `DB::open_cf_descriptors(&opts, path, cfs)` | `Db::open_cf_descriptors(opts, path, cfs)` |
+| `db.cf_handle("table")` | `db.cf_handle("table")` |
+| `db.get_cf(cf, key)` | `db.get_cf(&cf, key)` |
+| `db.put_cf(cf, key, value)` | `db.put_cf(&cf, key, value)` |
+| `db.delete_cf(cf, key)` | `db.delete_cf(&cf, key)` |
+| `db.prefix_iterator_cf(cf, prefix)` | `db.prefix_iterator_cf(&cf, prefix)` |
+| `db.iterator_cf(cf, IteratorMode::End)` | `db.iterator_cf(&cf, IteratorMode::End)` |
+| `WriteBatch::default()` | `WriteBatch::new()` |
+| `batch.put_cf(cf, key, value)` | `batch.put_cf(&cf, key, value)` |
+| `batch.delete_cf(cf, key)` | `batch.delete_cf(&cf, key)` |
+| `db.write(batch)` | `db.write(WriteOptions::default(), batch)` |
 
-**Column families → prefix namespacing:** ZIPP uses 30+ RocksDB column families
-for table isolation. Since xdb does not implement column families, the xdb
-backend uses prefix-based key namespacing: `table_name + \0 + actual_key`.
-This is the same approach ZIPP's in-memory backend uses, so the `StorageBackend`
-trait already supports it.
-
-**Key helper:** `prefix_successor(prefix)` computes the upper bound for prefix
-iteration, enabling efficient `scan_prefix` and `scan_prefix_reverse_limit`.
+**Column families** are implemented via prefix-based key namespacing: each CF
+is assigned a 1-byte ID that is transparently prepended to every key. This
+provides complete isolation between families while sharing a single LSM tree.
+Up to 256 column families are supported (ZIPP uses ~35).
 
 ---
 

@@ -71,6 +71,28 @@ impl WriteBatch {
         self.data.extend_from_slice(end_key);
     }
 
+    /// Append a `Put(key, value)` operation for a specific column family.
+    ///
+    /// The column family's ID byte is prepended to the key internally.
+    pub fn put_cf(&mut self, cf: &crate::column_family::ColumnFamily, key: &[u8], value: &[u8]) {
+        self.put(&cf.prefixed_key(key), value);
+    }
+
+    /// Append a `Delete(key)` operation for a specific column family.
+    pub fn delete_cf(&mut self, cf: &crate::column_family::ColumnFamily, key: &[u8]) {
+        self.delete(&cf.prefixed_key(key));
+    }
+
+    /// Append a `DeleteRange(start_key, end_key)` for a specific column family.
+    pub fn delete_range_cf(
+        &mut self,
+        cf: &crate::column_family::ColumnFamily,
+        start_key: &[u8],
+        end_key: &[u8],
+    ) {
+        self.delete_range(&cf.prefixed_key(start_key), &cf.prefixed_key(end_key));
+    }
+
     /// Remove all buffered operations and reset the header.
     pub fn clear(&mut self) {
         self.data.truncate(HEADER_SIZE);

@@ -73,6 +73,8 @@ pub struct Db {
     bg_sender: Sender<BgWork>,
     _bg_handle: Mutex<Option<thread::JoinHandle<()>>>,
     _lock_file: fs::File,
+    /// Column family mapping (None if opened without CFs).
+    cf_map: Option<crate::column_family::ColumnFamilyMap>,
 }
 
 struct DbState {
@@ -202,6 +204,7 @@ impl Db {
             bg_sender,
             _bg_handle: Mutex::new(None),
             _lock_file: lock_file,
+            cf_map: None,
         });
 
         // Spawn background thread for compaction and flush.
@@ -218,6 +221,134 @@ impl Db {
 
     /// Destroy a database by removing all files in its directory.
     ///
+    /// Open a database with column family support.
+    ///
+    /// Column families provide logical table namespacing. Each family is
+    /// assigned a 1-byte ID prefix, ensuring key isolation while sharing
+    /// a single LSM tree. The API matches RocksDB's column family interface.
+    ///
+    /// The "default" column family is always available. If not included in
+    /// `cfs`, it is added automatically.
+    pub fn open_cf_descriptors<P, I>(
+        options: Options,
+        path: P,
+        cfs: I,
+    ) -> Result<Arc<Self>>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = crate::column_family::ColumnFamilyDescriptor>,
+    {
+        let descriptors: Vec<_> = cfs.into_iter().collect();
+        let cf_map = crate::column_family::ColumnFamilyMap::new(&descriptors);
+        let mut db = Self::open(options, path)?;
+        // Safety: we just created the Arc and have the only reference.
+        Arc::get_mut(&mut db).unwrap().cf_map = Some(cf_map);
+        Ok(db)
+    }
+
+    /// Get a handle to a column family by name.
+    ///
+    /// Returns `None` if the column family does not exist or the database
+    /// was opened without column families.
+    pub fn cf_handle(&self, name: &str) -> Option<crate::column_family::ColumnFamily> {
+        self.cf_map.as_ref()?.get(name).cloned()
+    }
+
+    /// Read a value from a specific column family.
+    pub fn get_cf(
+        &self,
+        cf: &crate::column_family::ColumnFamily,
+        key: impl AsRef<[u8]>,
+    ) -> Result<Option<Vec<u8>>> {
+        self.get(&cf.prefixed_key(key.as_ref()))
+    }
+
+    /// Insert a key-value pair into a specific column family.
+    pub fn put_cf(
+        &self,
+        cf: &crate::column_family::ColumnFamily,
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+    ) -> Result<()> {
+        self.put(&cf.prefixed_key(key.as_ref()), value.as_ref())
+    }
+
+    /// Delete a key from a specific column family.
+    pub fn delete_cf(
+        &self,
+        cf: &crate::column_family::ColumnFamily,
+        key: impl AsRef<[u8]>,
+    ) -> Result<()> {
+        self.delete(&cf.prefixed_key(key.as_ref()))
+    }
+
+    /// Check if a key exists in a specific column family.
+    pub fn exists_cf(
+        &self,
+        cf: &crate::column_family::ColumnFamily,
+        key: impl AsRef<[u8]>,
+    ) -> Result<bool> {
+        self.exists(&cf.prefixed_key(key.as_ref()))
+    }
+
+    /// Create a prefix iterator within a specific column family.
+    ///
+    /// Scans all keys starting with `prefix` in the given column family.
+    /// Keys returned by the iterator have the CF prefix stripped.
+    pub fn prefix_iterator_cf(
+        &self,
+        cf: &crate::column_family::ColumnFamily,
+        prefix: impl AsRef<[u8]>,
+    ) -> DbIterator {
+        let full_prefix = cf.prefixed_key(prefix.as_ref());
+        self.prefix_iterator(&full_prefix)
+    }
+
+    /// Create an iterator within a specific column family using the given mode.
+    ///
+    /// Matches RocksDB's `iterator_cf(cf, IteratorMode)` API.
+    pub fn iterator_cf(
+        &self,
+        cf: &crate::column_family::ColumnFamily,
+        mode: crate::column_family::IteratorMode<'_>,
+    ) -> DbIterator {
+        use crate::column_family::{Direction, IteratorMode};
+
+        // Compute the CF's key range for bounding.
+        let cf_start = vec![cf.id];
+        let cf_end = if cf.id < 255 { Some(vec![cf.id + 1]) } else { None };
+
+        let mut iter = self.iter();
+
+        // Set upper bound to constrain iterator to this CF.
+        if let Some(ref end) = cf_end {
+            iter.set_upper_bound(end.clone());
+        }
+
+        match mode {
+            IteratorMode::Start => {
+                iter.seek(&cf_start);
+            }
+            IteratorMode::End => {
+                // Position at the last key in this CF.
+                if let Some(end) = cf_end.as_ref() {
+                    // seek_for_prev to just before the upper bound.
+                    iter.seek_for_prev(end);
+                } else {
+                    iter.seek_to_last();
+                }
+            }
+            IteratorMode::From(key, Direction::Forward) => {
+                iter.seek(&cf.prefixed_key(key));
+            }
+            IteratorMode::From(key, Direction::Reverse) => {
+                iter.seek_for_prev(&cf.prefixed_key(key));
+            }
+        }
+
+        iter
+    }
+
     /// The database must NOT be open. This permanently deletes all data.
     pub fn destroy(path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();

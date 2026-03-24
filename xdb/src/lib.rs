@@ -40,11 +40,13 @@ pub mod stats;
 pub mod compaction;
 pub mod rate_limiter;
 pub mod backup;
+pub mod column_family;
 pub mod db;
 
 // Re-export the main public API at crate root.
 pub use db::{Db, prefix_successor};
 pub use error::{Error, Result};
+pub use column_family::{ColumnFamily, ColumnFamilyDescriptor, IteratorMode, Direction};
 pub use options::{Options, ReadOptions, WalRecoveryMode, WriteOptions};
 pub use backup::{BackupEngine, BackupInfo};
 pub use batch::WriteBatch;

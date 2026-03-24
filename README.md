@@ -27,6 +27,7 @@ Rust application with zero FFI overhead.
 - **Manual compaction** -- `compact_range()` for maintenance operations
 - **Bloom filter existence check** -- `key_may_exist()` without reading value
 - **Database properties** -- `get_property()` for monitoring (L0 count, sizes, etc.)
+- **Column families** -- RocksDB-compatible table namespacing (up to 256 families)
 - **Rate limiter** -- token-bucket I/O throttling for background work
 - **WAL recovery modes** -- tolerate tail corruption, absolute consistency, or skip corrupted records
 - **Checkpoints** -- instant point-in-time copies via hard-linked SST files
@@ -161,6 +162,7 @@ cargo bench -p xdb --bench comparison      # xdb vs RocksDB
 | Method | Description |
 |--------|-------------|
 | `Db::open(opts, path)` | Open or create a database |
+| `Db::open_cf_descriptors(opts, path, cfs)` | Open with column families |
 | `Db::destroy(path)` | Delete a database and all its files |
 | `db.put(key, value)` | Insert or update a key |
 | `db.get(key)` | Read a value (returns `None` if absent) |
@@ -176,6 +178,12 @@ cargo bench -p xdb --bench comparison      # xdb vs RocksDB
 | `db.iter()` | Forward/backward iterator |
 | `db.iter_with_snapshot(snap)` | Iterator at a snapshot |
 | `db.prefix_iterator(prefix)` | Iterator scanning keys with given prefix |
+| `db.cf_handle(name)` | Get column family handle by name |
+| `db.get_cf(cf, key)` | Read from a column family |
+| `db.put_cf(cf, key, value)` | Write to a column family |
+| `db.delete_cf(cf, key)` | Delete from a column family |
+| `db.prefix_iterator_cf(cf, prefix)` | Prefix iterator within a column family |
+| `db.iterator_cf(cf, mode)` | Iterator with mode (Start/End/From) in a CF |
 | `db.snapshot()` | Create a point-in-time snapshot |
 | `db.release_snapshot(snap)` | Release a snapshot |
 | `db.get_property(name)` | Query internal stats by name |
@@ -191,6 +199,9 @@ cargo bench -p xdb --bench comparison      # xdb vs RocksDB
 
 **WalRecoveryMode:** `TolerateCorruptedTailRecords` (default), `AbsoluteConsistency`,
 `SkipAnyCorruptedRecords`.
+
+**Column families:** `ColumnFamilyDescriptor::new(name, opts)`, `cf_handle(name)`,
+`get_cf`, `put_cf`, `delete_cf`, `prefix_iterator_cf`, `iterator_cf(cf, mode)`.
 
 **BackupEngine:** `new(dir)`, `create_backup(db)`, `restore(id, path)`,
 `list_backups()`, `delete_backup(id)`.
