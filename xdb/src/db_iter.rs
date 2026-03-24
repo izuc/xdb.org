@@ -103,18 +103,46 @@ impl DbIterator {
     /// positions at the last key <= target. Useful for reverse iteration
     /// from a specific point.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
-        // Seek forward to the first entry >= target.
+        // If target is at or past the upper bound, position at the last
+        // key below the bound instead.
+        if let Some(ref bound) = self.upper_bound {
+            if target >= bound.as_slice() {
+                let ikey = InternalKey::new(bound, MAX_SEQUENCE_NUMBER, ValueType::Value);
+                self.inner.seek(ikey.as_bytes());
+                if self.inner.valid() {
+                    self.inner.prev();
+                } else {
+                    self.inner.seek_to_last();
+                }
+                self.find_prev_user_entry();
+                return;
+            }
+        }
+
+        // Normal case: target is within the valid range.
         self.seek(target);
         if self.valid {
-            // If we landed exactly on target, we're done.
             if self.saved_key.as_slice() == target {
                 return;
             }
             // We overshot (key > target), go back one entry.
             self.prev();
         } else {
-            // seek() went past the end — the last key is <= target.
-            self.seek_to_last();
+            // seek() returned invalid — either target is past all keys,
+            // or we overshot into/past the upper bound.
+            if let Some(bound) = self.upper_bound.clone() {
+                // Position at the last key below the bound.
+                let ikey = InternalKey::new(&bound, MAX_SEQUENCE_NUMBER, ValueType::Value);
+                self.inner.seek(ikey.as_bytes());
+                if self.inner.valid() {
+                    self.inner.prev();
+                } else {
+                    self.inner.seek_to_last();
+                }
+                self.find_prev_user_entry();
+            } else {
+                self.seek_to_last();
+            }
         }
     }
 

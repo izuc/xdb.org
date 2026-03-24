@@ -145,7 +145,10 @@ pub fn compact(
     // Versions with seq >= this value must be preserved. If no snapshots
     // are active, all older versions can be safely dropped.
     let preserve_below = oldest_snapshot_seq.unwrap_or(SequenceNumber::MAX);
-    let mut last_key_visible_to_snapshot = false;
+    // For each user key, tracks whether we've already emitted a version
+    // with seq < preserve_below. The oldest snapshot reads that version,
+    // so we keep exactly one and drop all subsequent ones below it.
+    let mut has_emitted_below: bool = false;
 
     while merger.valid() {
         let key = merger.key();
@@ -163,20 +166,28 @@ pub fn compact(
 
         if !is_range_tombstone {
             if user_key == last_user_key.as_slice() && !last_user_key.is_empty() {
-                // For a duplicate user key: keep the newest version, but
-                // also preserve any version that an active snapshot might
-                // need to see. A version is safe to drop only if:
-                // 1. We already emitted a newer version of this key, AND
-                // 2. This version's sequence is below the oldest snapshot.
-                if !last_key_visible_to_snapshot || seq < preserve_below {
+                // Duplicate user key. Keep versions that any snapshot
+                // might still need:
+                // - All versions with seq >= preserve_below (visible to
+                //   at least one snapshot).
+                // - The first (newest) version with seq < preserve_below
+                //   (the oldest snapshot reads this).
+                // - Drop all subsequent versions below the boundary.
+                if seq >= preserve_below {
+                    // Visible to at least one snapshot — keep.
+                } else if !has_emitted_below {
+                    // First version below snapshot boundary — the oldest
+                    // snapshot reads this version. Keep it.
+                    has_emitted_below = true;
+                } else {
+                    // No snapshot needs this version. Drop.
                     merger.next();
                     continue;
                 }
             } else {
                 // New user key — always keep the first (newest) version.
                 last_user_key = user_key.to_vec();
-                // Track whether any active snapshot could read older versions.
-                last_key_visible_to_snapshot = seq >= preserve_below;
+                has_emitted_below = seq < preserve_below;
             }
 
             // Check if this key is covered by a range tombstone.
@@ -204,11 +215,12 @@ pub fn compact(
         }
 
         // Drop deletion and range-deletion tombstones at the bottom level
-        // where no older files could still reference the key, BUT only if
-        // no active snapshot could still see through the tombstone.
+        // ONLY when no active snapshots exist. With active snapshots, a
+        // tombstone may still be the visible version for a snapshot reader
+        // and must be preserved alongside the data it shadows.
         if matches!(vt, Some(ValueType::Deletion) | Some(ValueType::RangeDeletion))
             && target_level == options.num_levels - 1
-            && seq < preserve_below
+            && oldest_snapshot_seq.is_none()
         {
             merger.next();
             continue;
