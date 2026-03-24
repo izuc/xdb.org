@@ -200,6 +200,11 @@ impl BlockReader {
     /// Create a `BlockReader` that references a slice of a shared buffer
     /// without copying. The `Arc<Vec<u8>>` keeps the underlying data alive.
     pub fn from_shared(buf: Arc<Vec<u8>>, start: usize, end: usize) -> error::Result<Self> {
+        assert!(
+            start <= end && end <= buf.len(),
+            "BlockReader::from_shared: invalid range {}..{} (buf len {})",
+            start, end, buf.len()
+        );
         let slice = &buf[start..end];
         let (restarts_offset, num_restarts) = Self::parse_restarts(slice.len(), slice)?;
         Ok(BlockReader {
@@ -554,10 +559,15 @@ impl<'a> BlockIterator<'a> {
         let block_data = self.block.data.as_slice();
         let data = &block_data[offset..self.block.data_end()];
 
-        let (_shared, n1) = match decode_varint32(data) {
+        let (shared, n1) = match decode_varint32(data) {
             Some(v) => v,
             None => return std::cmp::Ordering::Equal,
         };
+        // Restart points must always have shared=0. If not, the block is
+        // corrupt; treat as equal so the seek degrades gracefully.
+        if shared != 0 {
+            return std::cmp::Ordering::Equal;
+        }
         let (non_shared, n2) = match decode_varint32(&data[n1..]) {
             Some(v) => v,
             None => return std::cmp::Ordering::Equal,

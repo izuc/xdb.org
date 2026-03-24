@@ -291,6 +291,11 @@ impl MemTable {
     /// - `Some(Err(NotFound))` if the key was found with `ValueType::Deletion`.
     /// - `None` if the key is not present in this memtable.
     pub fn get(&self, lookup_key: &LookupKey) -> Option<error::Result<Vec<u8>>> {
+        // Fast path: skip the full 12-level skiplist descent for empty tables.
+        if self.list.first_node().is_null() {
+            return None;
+        }
+
         let target = lookup_key.internal_key();
         let node = self.list.find_greater_or_equal(target, None);
 
