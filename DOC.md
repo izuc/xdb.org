@@ -45,30 +45,34 @@ xdb is a from-scratch Rust reimplementation of the core ideas behind
 [RocksDB](https://rocksdb.org/) — an LSM-tree-based key-value store originally
 built at Facebook on top of Google's LevelDB. Where RocksDB is ~415,000 lines
 of C++ with decades of accumulated features, xdb distils the essential engine
-into ~12,600 lines of idiomatic, safe Rust.
+into ~13,000 lines of idiomatic, safe Rust.
 
 ### Design Goals
 
 | Goal | How |
 |------|-----|
-| **Lightweight** | ~12.6K lines of Rust vs ~415K lines of C++. No transactions, blob DB, wide columns, or other advanced features that most users don't need. |
+| **Lightweight** | ~13K lines of Rust vs ~415K lines of C++. No transactions, blob DB, wide columns, or other advanced features that most users don't need. |
 | **Fast** | O(1) direct-mapped block cache, zero-copy block reads, stack-allocated lookup keys, lock-free concurrent reads via RwLock + atomic skip list. Faster than RocksDB on both reads and writes. |
 | **Embeddable** | Pure Rust crate with `cargo add xdb`. No C/C++ toolchain, no FFI, no build.rs complexity. |
 | **Safe** | All public APIs are safe Rust. Unsafe code is limited to the skip list internals (atomic pointer manipulation) with a safe wrapper. |
-| **Correct** | CRC32 checksums on WAL records and SST blocks, crash-safe MANIFEST updates, WAL replay on recovery. 217 tests including 45 stress tests for data integrity, crash recovery, compaction, snapshots, and concurrency. |
+| **Correct** | CRC32 checksums on WAL records and SST blocks, crash-safe MANIFEST updates, WAL replay on recovery. 214 tests including 45 stress tests for data integrity, crash recovery, compaction, snapshots, and concurrency. |
 
 ### What xdb Implements
 
-- Put, Get, Delete, DeleteRange operations
-- Atomic WriteBatch (multiple operations in one atomic write)
+- Put, Get, MultiGet, Delete, DeleteRange operations
+- Atomic WriteBatch (multiple operations in one atomic write, optional WAL disable)
 - Write-Ahead Log for crash durability with CRC32 checksums
 - Lock-free SkipList MemTable (fixed-size node array, xorshift PRNG)
 - SST files with prefix-compressed blocks, bloom filters, and index blocks
 - Leveled compaction with background thread (releases lock during I/O)
 - MANIFEST-based version tracking with crash-tolerant recovery
 - Snapshots / MVCC (point-in-time consistent reads)
-- Forward and reverse iterators with snapshot isolation
+- Forward and reverse iterators with snapshot isolation and upper/lower bounds
 - Range deletes with sequence-aware tombstone filtering
+- Bloom-filter existence check (`key_may_exist`) without reading values
+- Manual compaction (`compact_range`) for maintenance operations
+- Database properties query (`get_property`) for production monitoring
+- Database destruction (`destroy`) for cleanup
 - Compression (LZ4 and Zstd via optional feature flags)
 - O(1) direct-mapped data block cache (per-TableReader, 512 slots)
 - O(1) direct-mapped table cache (per-Db, 256 slots + HashMap fallback)
@@ -170,9 +174,18 @@ db.write(WriteOptions::default(), batch).unwrap();
 // Range delete.
 db.delete_range(b"start", b"end").unwrap();
 
-// Range scan via iterator (forward and reverse).
+// Batch reads.
+let results = db.multi_get(&[b"key1", b"key2"]);
+
+// Bloom filter existence check (no value read).
+if db.key_may_exist(b"key1") {
+    let _ = db.get(b"key1"); // confirm with full read
+}
+
+// Iterator with upper bound.
 let mut iter = db.iter();
-iter.seek_to_first();
+iter.set_upper_bound(b"key3".to_vec());
+iter.seek(b"key1");
 while iter.valid() {
     println!("{:?} => {:?}", iter.key(), iter.value());
     iter.next();
@@ -184,10 +197,17 @@ db.put(b"key1", b"updated").unwrap();
 let mut snap_iter = db.iter_with_snapshot(&snap);
 snap_iter.seek(b"key1"); // still sees the old value
 
-// Statistics.
+// Write without WAL (for reconstructible state).
+let mut opts = WriteOptions::default();
+opts.disable_wal = true;
+db.put(b"ephemeral", b"data").unwrap();
+
+// Monitor database state.
+println!("{}", db.get_property("xdb.level-summary").unwrap());
 println!("{}", db.stats());
 
-// Flush to disk and close.
+// Manual compaction and close.
+db.compact_range(None, None).unwrap();
 db.flush().unwrap();
 db.close().unwrap();
 ```
@@ -204,17 +224,22 @@ cheaply cloned and shared across threads.
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `open` | `fn open(options: Options, path: impl AsRef<Path>) -> Result<Arc<Db>>` | Open or create a database. |
-| `put` | `fn put(&self, key: &[u8], value: &[u8]) -> Result<()>` | Insert a key-value pair. |
+| `destroy` | `fn destroy(path: impl AsRef<Path>) -> Result<()>` | Delete a database and all its files. |
+| `put` | `fn put(&self, key: &[u8], value: &[u8]) -> Result<()>` | Insert or update a key-value pair. |
 | `get` | `fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>` | Read a value. Returns `None` if not found. |
+| `multi_get` | `fn multi_get(&self, keys: &[&[u8]]) -> Vec<Result<Option<Vec<u8>>>>` | Batch read multiple keys in one snapshot. |
 | `delete` | `fn delete(&self, key: &[u8]) -> Result<()>` | Delete a key (writes a tombstone). |
 | `delete_range` | `fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()>` | Delete all keys in `[start, end)`. |
 | `write` | `fn write(&self, opts: WriteOptions, batch: WriteBatch) -> Result<()>` | Apply a batch atomically. |
+| `key_may_exist` | `fn key_may_exist(&self, key: &[u8]) -> bool` | Bloom-filter existence check (no value read). |
 | `flush` | `fn flush(&self) -> Result<()>` | Force the memtable to disk. |
-| `close` | `fn close(&self) -> Result<()>` | Graceful shutdown. |
+| `compact_range` | `fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()>` | Manual compaction of a key range. |
+| `close` | `fn close(&self) -> Result<()>` | Graceful shutdown with sync. |
 | `iter` | `fn iter(&self) -> DbIterator` | Forward/backward iterator over all entries. |
 | `iter_with_snapshot` | `fn iter_with_snapshot(&self, snap: &Snapshot) -> DbIterator` | Iterator at a snapshot. |
 | `snapshot` | `fn snapshot(&self) -> Arc<Snapshot>` | Create a point-in-time snapshot. |
 | `release_snapshot` | `fn release_snapshot(&self, snap: &Snapshot)` | Release a snapshot. |
+| `get_property` | `fn get_property(&self, name: &str) -> Option<String>` | Query internal stats by name. |
 | `stats` | `fn stats(&self) -> &Statistics` | Get live statistics counters. |
 
 ### `WriteBatch`
@@ -281,6 +306,42 @@ let opts = Options::default()
 | `max_open_files` | 1000 | Max SST files kept open in the table cache. |
 | `sync_writes` | `false` | Fsync the WAL on every write. |
 | `rate_limiter` | `None` | Optional token-bucket rate limiter for background I/O. |
+
+### WriteOptions
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `sync` | `false` | Fsync the WAL before returning from the write. |
+| `disable_wal` | `false` | Skip WAL for reconstructible state (lost on crash if not flushed). |
+
+### DbIterator Methods
+
+| Method | Description |
+|--------|-------------|
+| `seek_to_first()` | Position at the first entry. |
+| `seek_to_last()` | Position at the last entry. |
+| `seek(target)` | Position at the first entry with key >= target. |
+| `next()` | Advance to the next entry. |
+| `prev()` | Move to the previous entry. |
+| `key()` / `value()` | Current entry's key and value. |
+| `valid()` | Whether the iterator is positioned at a valid entry. |
+| `set_upper_bound(key)` | Stop iteration when key reaches this bound (exclusive). |
+| `set_lower_bound(key)` | Convenience for `seek(key)`. |
+
+### Database Properties
+
+Queryable via `db.get_property(name)`:
+
+| Property | Example | Description |
+|----------|---------|-------------|
+| `xdb.num-files-at-levelN` | `"3"` | File count at level N |
+| `xdb.level-summary` | `"L0:3 L1:10 L2:45"` | One-line level summary |
+| `xdb.total-sst-size` | `"134217728"` | Total bytes across all SST files |
+| `xdb.mem-usage` | `"4194304"` | Approximate memtable memory usage |
+| `xdb.last-sequence` | `"12345"` | Current sequence number |
+| `xdb.num-snapshots` | `"2"` | Number of active snapshots |
+| `xdb.num-entries` | `"58"` | Approximate total file count |
+| `xdb.num-levels` | `"7"` | Number of configured levels |
 
 ---
 
@@ -530,7 +591,7 @@ xdb/src/
 
 | Component | Lines | Purpose |
 |-----------|-------|---------|
-| `db.rs` | 1,334 | Main coordinator |
+| `db.rs` | 1,550 | Main coordinator |
 | `sst/` | 2,700 | SST format + block cache + zero-copy |
 | `memtable/` | 730 | SkipList + OwnedMemTableIterator |
 | `types.rs` | 540 | Core types, varint, LookupKey |
@@ -541,11 +602,11 @@ xdb/src/
 | `batch.rs` | 480 | WriteBatch |
 | `db_iter.rs` | 630 | User-facing iterator |
 | Other | 1,800 | table_cache, snapshot, stats, options, etc. |
-| **Source total** | **~10,600** | |
+| **Source total** | **~11,000** | |
 | Tests (stress) | 860 | 45 stress tests |
 | Tests (integration) | 570 | 23 integration tests |
 | Benchmarks | 330 | Criterion + RocksDB comparison |
-| **Grand total** | **~12,600** | |
+| **Grand total** | **~13,000** | |
 
 ---
 
@@ -554,7 +615,7 @@ xdb/src/
 | Aspect | RocksDB | xdb |
 |--------|---------|-----|
 | Language | C++ | Rust |
-| Lines of code | ~415,000 | ~12,600 |
+| Lines of code | ~415,000 | ~13,000 |
 | Random read latency | ~950 ns | **~600 ns** |
 | Sequential write throughput | 23K ops/s | **40K ops/s** |
 | Compaction strategies | Leveled, Universal, FIFO | Leveled |
