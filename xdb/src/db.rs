@@ -254,23 +254,30 @@ impl Db {
 
         let lookup = LookupKey::new(key, sequence);
 
-        // Collect range tombstones from all sources so point lookups
-        // correctly return None for keys covered by delete_range().
-        let range_tombstones = self.collect_range_tombstones_for_get(
-            key, &mem, imm.as_deref(), &version, sequence,
-        );
+        // Fast-path: check whether ANY range tombstones could exist.
+        // Memtable flags are atomic booleans (no lock needed). If neither
+        // memtable has range tombstones, we can defer the expensive SST
+        // tombstone scan until we actually find a value -- and even then
+        // we only need to check the specific reader that produced it plus
+        // the memtable flags.
+        let mem_has_tombstones = mem.has_range_tombstones()
+            || imm.as_ref().is_some_and(|i| i.has_range_tombstones());
 
         // 1. Active memtable.
         if let Some(result) = mem.get(&lookup) {
             Statistics::record(&self.stats.memtable_hits, 1);
             return match result {
                 Ok(value) => {
-                    if Self::is_key_range_deleted(key, sequence, &range_tombstones) {
-                        Ok(None)
-                    } else {
-                        Statistics::record(&self.stats.bytes_read, value.len() as u64);
-                        Ok(Some(value))
+                    if mem_has_tombstones {
+                        let range_tombstones = self.collect_range_tombstones_for_get(
+                            key, &mem, imm.as_deref(), &version, sequence,
+                        );
+                        if Self::is_key_range_deleted(key, sequence, &range_tombstones) {
+                            return Ok(None);
+                        }
                     }
+                    Statistics::record(&self.stats.bytes_read, value.len() as u64);
+                    Ok(Some(value))
                 }
                 Err(Error::NotFound(_)) => Ok(None),
                 Err(e) => Err(e),
@@ -283,12 +290,16 @@ impl Db {
                 Statistics::record(&self.stats.memtable_hits, 1);
                 return match result {
                     Ok(value) => {
-                        if Self::is_key_range_deleted(key, sequence, &range_tombstones) {
-                            Ok(None)
-                        } else {
-                            Statistics::record(&self.stats.bytes_read, value.len() as u64);
-                            Ok(Some(value))
+                        if mem_has_tombstones {
+                            let range_tombstones = self.collect_range_tombstones_for_get(
+                                key, &mem, imm.as_deref(), &version, sequence,
+                            );
+                            if Self::is_key_range_deleted(key, sequence, &range_tombstones) {
+                                return Ok(None);
+                            }
                         }
+                        Statistics::record(&self.stats.bytes_read, value.len() as u64);
+                        Ok(Some(value))
                     }
                     Err(Error::NotFound(_)) => Ok(None),
                     Err(e) => Err(e),
@@ -307,7 +318,11 @@ impl Db {
             }
             match self.search_sst_file(file_meta, key, sequence)? {
                 SearchResult::Found(value) => {
-                    if Self::is_key_range_deleted(key, sequence, &range_tombstones) {
+                    // Lazily check range tombstones only when a value is found.
+                    if self.check_range_tombstones_for_found_key(
+                        key, sequence, mem_has_tombstones, &mem, imm.as_deref(),
+                        &version, file_meta,
+                    )? {
                         return Ok(None);
                     }
                     return Ok(Some(value));
@@ -333,7 +348,10 @@ impl Db {
             }
             match self.search_sst_file(file_meta, key, sequence)? {
                 SearchResult::Found(value) => {
-                    if Self::is_key_range_deleted(key, sequence, &range_tombstones) {
+                    if self.check_range_tombstones_for_found_key(
+                        key, sequence, mem_has_tombstones, &mem, imm.as_deref(),
+                        &version, file_meta,
+                    )? {
                         return Ok(None);
                     }
                     return Ok(Some(value));
@@ -344,6 +362,39 @@ impl Db {
         }
 
         Ok(None)
+    }
+
+    /// Check range tombstones lazily, only when a value has been found in an
+    /// SST file. If no memtable has tombstones AND the source file has no
+    /// cached tombstones, skip the expensive full scan entirely.
+    #[allow(clippy::too_many_arguments)]
+    fn check_range_tombstones_for_found_key(
+        &self,
+        user_key: &[u8],
+        sequence: SequenceNumber,
+        mem_has_tombstones: bool,
+        mem: &MemTable,
+        imm: Option<&MemTable>,
+        version: &Version,
+        source_file: &FileMetaData,
+    ) -> Result<bool> {
+        // Fast path: check the source file's cached tombstones first.
+        let reader = self.table_cache.get_reader(
+            source_file.number,
+            source_file.file_size,
+        )?;
+        let source_has_tombstones = !reader.range_tombstones().is_empty();
+
+        if !mem_has_tombstones && !source_has_tombstones {
+            // Common case: no range deletes anywhere relevant. Skip.
+            return Ok(false);
+        }
+
+        // Slow path: some tombstones exist, do the full collection.
+        let range_tombstones = self.collect_range_tombstones_for_get(
+            user_key, mem, imm, version, sequence,
+        );
+        Ok(Self::is_key_range_deleted(user_key, sequence, &range_tombstones))
     }
 
     /// Apply a `WriteBatch` atomically.
@@ -790,6 +841,10 @@ impl Db {
     }
 
     /// Search a single SST file for a user key via the table cache.
+    ///
+    /// Uses `TableReader::get_for_user_key` which reads only the single
+    /// data block that may contain the key, instead of materializing the
+    /// entire index.
     fn search_sst_file(
         &self,
         file_meta: &FileMetaData,
@@ -801,43 +856,21 @@ impl Db {
             file_meta.file_size,
         )?;
 
-        // Fast reject via bloom filter.
+        // Fast reject via bloom filter (checked inside get_for_user_key,
+        // but we check here first to record the stat).
         if !reader.bloom_may_contain(user_key) {
             Statistics::record(&self.stats.bloom_useful, 1);
             return Ok(SearchResult::NotFound);
         }
 
-        // Seek with the raw user_key (not an InternalKey) so bytewise
-        // comparison in the block iterator always lands at or before the
-        // first entry for this user key, regardless of sequence ordering.
-        let mut table_iter = reader.iter();
-        table_iter.seek(user_key);
-
-        while table_iter.valid() {
-            let found_key = table_iter.key();
-            if let Some(parsed) = ParsedInternalKey::from_bytes(found_key) {
-                if parsed.user_key == user_key && parsed.sequence <= sequence {
-                    match parsed.value_type {
-                        ValueType::Value => {
-                            let value = table_iter.value().to_vec();
-                            Statistics::record(&self.stats.bytes_read, value.len() as u64);
-                            return Ok(SearchResult::Found(value));
-                        }
-                        ValueType::Deletion | ValueType::RangeDeletion => {
-                            return Ok(SearchResult::Deleted);
-                        }
-                    }
-                }
-                if parsed.user_key > user_key {
-                    break;
-                }
-            } else {
-                break;
+        match reader.get_for_user_key(user_key, sequence)? {
+            Some(crate::sst::UserKeyResult::Found(value)) => {
+                Statistics::record(&self.stats.bytes_read, value.len() as u64);
+                Ok(SearchResult::Found(value))
             }
-            table_iter.next();
+            Some(crate::sst::UserKeyResult::Deleted) => Ok(SearchResult::Deleted),
+            None => Ok(SearchResult::NotFound),
         }
-
-        Ok(SearchResult::NotFound)
     }
 
     // -----------------------------------------------------------------------

@@ -19,6 +19,14 @@ use crate::sst::footer::{BlockHandle, Footer, FOOTER_SIZE};
 /// Size of the block trailer on disk (compression_type: u8 + checksum: u32 LE).
 const BLOCK_TRAILER_SIZE: usize = 5;
 
+/// Result of a user-key lookup that accounts for sequence numbers and deletions.
+pub enum UserKeyResult {
+    /// The key was found with this value.
+    Found(Vec<u8>),
+    /// The key was found as a deletion tombstone.
+    Deleted,
+}
+
 /// Reads an SST file and provides point lookups and iteration.
 ///
 /// The entire file is read into memory on open. For Phase 1 this is acceptable
@@ -186,6 +194,79 @@ impl TableReader {
                 data_iter.key().to_vec(),
                 data_iter.value().to_vec(),
             )));
+        }
+
+        Ok(None)
+    }
+
+    /// Point lookup by user key and sequence number.
+    ///
+    /// Unlike [`get`](Self::get), which compares raw internal keys, this
+    /// method takes a user key (without the 8-byte sequence/type suffix) and
+    /// a snapshot sequence number. It:
+    ///
+    /// 1. Checks the bloom filter for a fast negative.
+    /// 2. Seeks the index block to find the candidate data block.
+    /// 3. Reads and parses only that single data block.
+    /// 4. Scans for the first entry where `parsed.user_key == user_key`
+    ///    and `parsed.sequence <= sequence`.
+    ///
+    /// Returns `Ok(Some(UserKeyResult::Found(value)))` on a value hit,
+    /// `Ok(Some(UserKeyResult::Deleted))` if the key is a deletion
+    /// tombstone, or `Ok(None)` if the key is absent.
+    pub fn get_for_user_key(
+        &self,
+        user_key: &[u8],
+        sequence: u64,
+    ) -> Result<Option<UserKeyResult>> {
+        use crate::types::{ParsedInternalKey, ValueType};
+
+        // 1. Bloom filter fast-reject.
+        if let Some(ref fd) = self.filter_data {
+            if !BloomFilter::may_contain(fd, user_key) {
+                return Ok(None);
+            }
+        }
+
+        // 2. Seek the index block. We search with the raw user_key so the
+        //    bytewise comparison lands at or before the first internal key
+        //    that starts with user_key.
+        let mut index_iter = self.index_block.iter();
+        index_iter.seek(user_key);
+        if !index_iter.valid() {
+            return Ok(None);
+        }
+
+        // 3. Decode block handle and read the single data block.
+        let (block_handle, _) = BlockHandle::decode(index_iter.value())
+            .ok_or_else(|| Error::corruption("bad block handle in index"))?;
+        let block_data = read_block_from_buf(&self.data, &block_handle)?;
+        let block = BlockReader::new(block_data)?;
+
+        // 4. Seek within the data block and scan forward.
+        let mut data_iter = block.iter();
+        data_iter.seek(user_key);
+
+        while data_iter.valid() {
+            if let Some(parsed) = ParsedInternalKey::from_bytes(data_iter.key()) {
+                if parsed.user_key == user_key && parsed.sequence <= sequence {
+                    return match parsed.value_type {
+                        ValueType::Value => {
+                            Ok(Some(UserKeyResult::Found(data_iter.value().to_vec())))
+                        }
+                        ValueType::Deletion | ValueType::RangeDeletion => {
+                            Ok(Some(UserKeyResult::Deleted))
+                        }
+                    };
+                }
+                // If we've moved past the user key, stop scanning.
+                if parsed.user_key > user_key {
+                    break;
+                }
+            } else {
+                break;
+            }
+            data_iter.next();
         }
 
         Ok(None)

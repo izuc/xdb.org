@@ -267,11 +267,10 @@ impl<'a> BlockIterator<'a> {
         let mut left = 0usize;
         let mut right = num;
 
-        // Binary search over restart points.
+        // Binary search over restart points (allocation-free).
         while left < right {
             let mid = left + (right - left) / 2;
-            let key_at_restart = self.decode_restart_key(mid);
-            if key_at_restart.as_slice() <= target {
+            if self.compare_restart_key_with(mid, target) != std::cmp::Ordering::Greater {
                 left = mid + 1;
             } else {
                 right = mid;
@@ -495,31 +494,38 @@ impl<'a> BlockIterator<'a> {
         self.valid = true;
     }
 
-    /// Decode the key stored at a specific restart point (shared must be 0).
-    fn decode_restart_key(&self, restart_index: usize) -> Vec<u8> {
+    /// Compare the key at a restart point with a target, without allocating.
+    ///
+    /// At restart points `shared` is always 0, so the full key is stored
+    /// inline. We parse the header and compare the key bytes directly.
+    fn compare_restart_key_with(
+        &self,
+        restart_index: usize,
+        target: &[u8],
+    ) -> std::cmp::Ordering {
         let offset = self.block.restart_offset(restart_index);
         let data = &self.block.data[offset..self.block.data_end()];
 
         let (_shared, n1) = match decode_varint32(data) {
             Some(v) => v,
-            None => return Vec::new(),
+            None => return std::cmp::Ordering::Equal,
         };
         let (non_shared, n2) = match decode_varint32(&data[n1..]) {
             Some(v) => v,
-            None => return Vec::new(),
+            None => return std::cmp::Ordering::Equal,
         };
         let (_value_len, n3) = match decode_varint32(&data[n1 + n2..]) {
             Some(v) => v,
-            None => return Vec::new(),
+            None => return std::cmp::Ordering::Equal,
         };
 
         let header_len = n1 + n2 + n3;
         let non_shared = non_shared as usize;
         if header_len + non_shared > data.len() {
-            return Vec::new();
+            return std::cmp::Ordering::Equal;
         }
 
-        data[header_len..header_len + non_shared].to_vec()
+        data[header_len..header_len + non_shared].cmp(target)
     }
 }
 

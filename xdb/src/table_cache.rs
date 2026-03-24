@@ -5,14 +5,15 @@
 //! keyed by [`FileNumber`], so that repeated reads against the same SST hit the
 //! cache instead of the filesystem.
 //!
-//! Thread safety is provided by a [`parking_lot::Mutex`] around the inner map.
+//! Thread safety is provided by a [`parking_lot::RwLock`] around the inner map.
+//! Cache hits only acquire a read lock, allowing concurrent readers.
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 
 use crate::error::Result;
 use crate::options::Options;
@@ -21,24 +22,31 @@ use crate::types::FileNumber;
 
 /// Caches open [`TableReader`] instances to avoid re-opening SST files.
 ///
-/// The cache is thread-safe and uses a simple `HashMap` protected by a `Mutex`.
-/// When the cache exceeds `max_open_files`, the least-recently-used 25% of
-/// entries are evicted.
+/// The cache is thread-safe and uses a `HashMap` protected by an `RwLock`.
+/// Cache hits (the common case) only acquire a read lock, allowing
+/// concurrent readers without contention. Cache misses acquire a write
+/// lock to insert a new entry.
+///
+/// When the cache exceeds `max_open_files`, the oldest 25% of entries
+/// are evicted (by insertion order, tracked on the write path only).
 pub struct TableCache {
     dbname: PathBuf,
     options: Arc<Options>,
-    cache: Mutex<CacheInner>,
+    cache: RwLock<CacheInner>,
 }
 
 struct CacheInner {
     readers: HashMap<FileNumber, CacheEntry>,
     max_open: usize,
-    access_counter: u64,
+    /// Monotonically increasing counter, bumped only on inserts (write path).
+    insert_counter: u64,
 }
 
 struct CacheEntry {
     reader: Arc<TableReader>,
-    last_access: u64,
+    /// Insertion order for LRU eviction (set once on insert, never updated
+    /// on read so the read path stays lock-free).
+    insert_order: u64,
 }
 
 impl TableCache {
@@ -51,44 +59,53 @@ impl TableCache {
         TableCache {
             dbname: dbname.to_path_buf(),
             options,
-            cache: Mutex::new(CacheInner {
+            cache: RwLock::new(CacheInner {
                 readers: HashMap::new(),
                 max_open: max_open_files,
-                access_counter: 0,
+                insert_counter: 0,
             }),
         }
     }
 
     /// Get a [`TableReader`] for the given file number.
     ///
-    /// If the reader is already cached, its last-access timestamp is updated
-    /// and it is returned immediately. Otherwise, the SST file is opened from
-    /// disk, wrapped in an `Arc`, and inserted into the cache.
+    /// Cache hits use a read lock only (no writer exclusion), so multiple
+    /// threads can look up cached readers concurrently. Cache misses
+    /// acquire a write lock to insert a new entry.
     ///
     /// `file_size` is required when opening the file for the first time.
     pub fn get_reader(&self, file_number: FileNumber, file_size: u64) -> Result<Arc<TableReader>> {
-        let mut inner = self.cache.lock();
+        // Fast path: read lock for cache hits.
+        {
+            let inner = self.cache.read();
+            if let Some(entry) = inner.readers.get(&file_number) {
+                return Ok(Arc::clone(&entry.reader));
+            }
+        }
 
-        // Fast path: cache hit.
-        inner.access_counter += 1;
-        let current_access = inner.access_counter;
+        // Slow path: write lock for cache misses.
+        let mut inner = self.cache.write();
 
-        if let Some(entry) = inner.readers.get_mut(&file_number) {
-            entry.last_access = current_access;
+        // Double-check after acquiring write lock (another thread may have
+        // inserted while we were waiting for the lock upgrade).
+        if let Some(entry) = inner.readers.get(&file_number) {
             return Ok(Arc::clone(&entry.reader));
         }
 
-        // Slow path: open the file and create a new reader.
+        // Open the file and create a new reader.
         let path = self.dbname.join(crate::types::sst_file_name(file_number));
         let file = fs::File::open(&path)?;
         let reader = TableReader::open(file, file_size, (*self.options).clone())?;
         let reader = Arc::new(reader);
 
+        inner.insert_counter += 1;
+        let insert_order = inner.insert_counter;
+
         inner.readers.insert(
             file_number,
             CacheEntry {
                 reader: Arc::clone(&reader),
-                last_access: current_access,
+                insert_order,
             },
         );
 
@@ -105,34 +122,34 @@ impl TableCache {
     /// This should be called after an SST file is deleted (e.g., by
     /// compaction) so that the cache does not hold a stale reference.
     pub fn evict(&self, file_number: FileNumber) {
-        self.cache.lock().readers.remove(&file_number);
+        self.cache.write().readers.remove(&file_number);
     }
 
     /// Remove all cached readers.
     pub fn evict_all(&self) {
-        self.cache.lock().readers.clear();
+        self.cache.write().readers.clear();
     }
 
     /// Return the number of currently cached readers.
     pub fn len(&self) -> usize {
-        self.cache.lock().readers.len()
+        self.cache.read().readers.len()
     }
 
     /// Return `true` if no readers are currently cached.
     pub fn is_empty(&self) -> bool {
-        self.cache.lock().readers.is_empty()
+        self.cache.read().readers.is_empty()
     }
 
-    /// Evict the oldest 25% of entries by `last_access`.
+    /// Evict the oldest 25% of entries by `insert_order`.
     fn evict_oldest(inner: &mut CacheInner) {
         let mut entries: Vec<(FileNumber, u64)> = inner
             .readers
             .iter()
-            .map(|(&file_num, entry)| (file_num, entry.last_access))
+            .map(|(&file_num, entry)| (file_num, entry.insert_order))
             .collect();
 
-        // Sort by last_access ascending (oldest first).
-        entries.sort_by_key(|&(_, access)| access);
+        // Sort by insert_order ascending (oldest first).
+        entries.sort_by_key(|&(_, order)| order);
 
         // Remove the oldest 25% (at least 1).
         let to_remove = (entries.len() / 4).max(1);
