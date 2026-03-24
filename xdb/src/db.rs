@@ -484,48 +484,41 @@ impl Db {
             }
         }
 
-        // SST file iterators via table cache.
-        for level in 0..version.num_levels {
-            for file_meta in version.files_at_level(level) {
-                if let Ok(reader) = self.table_cache.get_reader(
-                    file_meta.number,
-                    file_meta.file_size,
-                ) {
-                    children.push(Box::new(reader.iter()));
-                }
-            }
-        }
-
-        // Collect range tombstones from memtables and SST files.
-        // Uses streaming iterators to avoid loading all entries into memory.
+        // Collect range tombstones from memtables.
         let mut range_tombstones = Vec::new();
         Self::collect_range_tombstones_from_mem(&mem, sequence, &mut range_tombstones);
         if let Some(ref imm) = imm {
             Self::collect_range_tombstones_from_mem(imm, sequence, &mut range_tombstones);
         }
+
+        // SST file iterators + range tombstones in a SINGLE pass.
+        // This avoids a race where concurrent compaction deletes a file
+        // between two separate get_reader calls.
         for level in 0..version.num_levels {
             for file_meta in version.files_at_level(level) {
                 if let Ok(reader) = self.table_cache.get_reader(
                     file_meta.number,
                     file_meta.file_size,
                 ) {
-                    // Use the streaming iterator instead of loading all entries.
-                    let mut table_iter = reader.iter();
-                    table_iter.seek_to_first();
-                    while table_iter.valid() {
-                        if let Some(p) = ParsedInternalKey::from_bytes(table_iter.key()) {
+                    // Scan for range tombstones from this reader.
+                    let mut scan = reader.iter();
+                    scan.seek_to_first();
+                    while scan.valid() {
+                        if let Some(p) = ParsedInternalKey::from_bytes(scan.key()) {
                             if p.value_type == ValueType::RangeDeletion
                                 && p.sequence <= sequence
                             {
                                 range_tombstones.push((
                                     p.user_key.to_vec(),
-                                    table_iter.value().to_vec(),
+                                    scan.value().to_vec(),
                                     p.sequence,
                                 ));
                             }
                         }
-                        table_iter.next();
+                        scan.next();
                     }
+                    // Create the merge child iterator from the same reader.
+                    children.push(Box::new(reader.iter()));
                 }
             }
         }
