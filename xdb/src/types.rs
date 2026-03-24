@@ -161,6 +161,11 @@ pub struct LookupKey {
 impl LookupKey {
     pub fn new(user_key: &[u8], sequence: SequenceNumber) -> Self {
         let internal_len = user_key.len() + 8;
+        assert!(
+            internal_len <= u32::MAX as usize,
+            "user key too large ({} bytes)",
+            user_key.len()
+        );
         let mut data = Vec::with_capacity(5 + internal_len); // varint32 max 5 bytes
         encode_varint32(&mut data, internal_len as u32);
         let key_start = data.len();
