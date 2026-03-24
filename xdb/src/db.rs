@@ -546,11 +546,18 @@ impl Db {
     }
 
     /// Collect range tombstones from a memtable.
+    ///
+    /// Uses a fast-path flag: if the memtable has never seen a RangeDeletion
+    /// entry, the scan is skipped entirely. This keeps get() O(log N) for
+    /// the common case where delete_range() is not used.
     fn collect_range_tombstones_from_mem(
         mem: &MemTable,
         sequence: SequenceNumber,
         out: &mut Vec<(Vec<u8>, Vec<u8>, SequenceNumber)>,
     ) {
+        if !mem.has_range_tombstones() {
+            return;
+        }
         let mut iter = mem.iter();
         iter.seek_to_first();
         while iter.valid() {

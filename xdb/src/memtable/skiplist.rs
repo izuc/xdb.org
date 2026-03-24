@@ -11,7 +11,7 @@ use crate::types::{
     LookupKey, SequenceNumber, ValueType,
 };
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 
 /// Maximum height a skiplist node may reach.
 const MAX_HEIGHT: usize = 12;
@@ -236,6 +236,10 @@ impl Drop for SkipList {
 pub struct MemTable {
     list: SkipList,
     memory_usage: AtomicUsize,
+    /// Fast flag: set to true when any RangeDeletion entry is added.
+    /// Allows `collect_range_tombstones_from_mem` to skip a full scan
+    /// when no range tombstones exist (the common case).
+    has_range_tombstones: AtomicBool,
 }
 
 impl MemTable {
@@ -244,7 +248,13 @@ impl MemTable {
         MemTable {
             list: SkipList::new(),
             memory_usage: AtomicUsize::new(0),
+            has_range_tombstones: AtomicBool::new(false),
         }
+    }
+
+    /// Whether this memtable contains any range tombstones.
+    pub fn has_range_tombstones(&self) -> bool {
+        self.has_range_tombstones.load(Ordering::Relaxed)
     }
 
     /// Insert an entry into the memtable.
@@ -268,6 +278,10 @@ impl MemTable {
             + std::mem::size_of::<Node>()
             + MAX_HEIGHT * std::mem::size_of::<AtomicPtr<Node>>();
         self.memory_usage.fetch_add(usage, Ordering::Relaxed);
+
+        if value_type == ValueType::RangeDeletion {
+            self.has_range_tombstones.store(true, Ordering::Relaxed);
+        }
 
         self.list.insert(key_bytes, value_bytes);
     }
