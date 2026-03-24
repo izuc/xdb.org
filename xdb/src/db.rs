@@ -216,11 +216,69 @@ impl Db {
         Ok(db)
     }
 
+    /// Destroy a database by removing all files in its directory.
+    ///
+    /// The database must NOT be open. This permanently deletes all data.
+    pub fn destroy(path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if path.exists() {
+            fs::remove_dir_all(path)?;
+        }
+        Ok(())
+    }
+
     /// Insert a key-value pair.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let mut batch = WriteBatch::new();
         batch.put(key, value);
         self.write(WriteOptions::default(), batch)
+    }
+
+    /// Check if a key might exist without reading its value.
+    ///
+    /// Uses bloom filters for a fast negative: returns `false` if the key
+    /// is **definitely not** in any SST file. Returns `true` if the key
+    /// **might** exist (could be a false positive from the bloom filter,
+    /// or the key is in the memtable).
+    ///
+    /// This is cheaper than `get()` because it skips reading the data block.
+    /// For definitive existence checks, use `get()`.
+    pub fn key_may_exist(&self, key: &[u8]) -> bool {
+        let (mem, imm, version, sequence) = {
+            let state = self.state.read();
+            (
+                Arc::clone(&state.mem),
+                state.imm.as_ref().map(Arc::clone),
+                state.versions.current(),
+                state.versions.last_sequence(),
+            )
+        };
+
+        // Check memtable.
+        let lookup = LookupKey::new(key, sequence);
+        if mem.get(&lookup).is_some() {
+            return true;
+        }
+        if let Some(ref imm) = imm {
+            if imm.get(&lookup).is_some() {
+                return true;
+            }
+        }
+
+        // Check SST files via bloom filters only.
+        for level in 0..version.num_levels {
+            for file_meta in version.files_at_level(level) {
+                if let Ok(reader) = self.table_cache.get_reader(
+                    file_meta.number,
+                    file_meta.file_size,
+                ) {
+                    if reader.bloom_may_contain(key) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Delete a key.
@@ -479,14 +537,12 @@ impl Db {
             .versions
             .set_last_sequence(last_seq + batch.count() as u64);
 
-        if let Some(ref mut wal) = state.wal {
-            wal.add_record(batch.data())?;
-            // Note: sync is under the lock because WalWriter::sync requires
-            // &mut self. Moving the WAL to a separate Mutex would allow
-            // sync outside the state lock (group commit). Acceptable for now
-            // since sync_writes=false is the default.
-            if write_opts.sync || self.options.sync_writes {
-                wal.sync()?;
+        if !write_opts.disable_wal {
+            if let Some(ref mut wal) = state.wal {
+                wal.add_record(batch.data())?;
+                if write_opts.sync || self.options.sync_writes {
+                    wal.sync()?;
+                }
             }
         }
 

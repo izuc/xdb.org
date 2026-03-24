@@ -24,6 +24,9 @@ pub struct DbIterator {
     valid: bool,
     /// Range tombstones: (start_key_inclusive, end_key_exclusive, sequence).
     range_tombstones: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)>,
+    /// Optional upper bound (exclusive). The iterator automatically becomes
+    /// invalid when advancing past this key.
+    upper_bound: Option<Vec<u8>>,
 }
 
 impl DbIterator {
@@ -36,6 +39,7 @@ impl DbIterator {
             saved_value: Vec::new(),
             valid: false,
             range_tombstones: Vec::new(),
+            upper_bound: None,
         }
     }
 
@@ -52,7 +56,21 @@ impl DbIterator {
             saved_value: Vec::new(),
             valid: false,
             range_tombstones,
+            upper_bound: None,
         }
+    }
+
+    /// Set an upper bound (exclusive) for the iterator. The iterator will
+    /// automatically become invalid when it advances past this key.
+    /// Must be called before seeking.
+    pub fn set_upper_bound(&mut self, bound: Vec<u8>) {
+        self.upper_bound = Some(bound);
+    }
+
+    /// Set a lower bound (inclusive) by seeking to it. Convenience method
+    /// equivalent to calling `seek(bound)`.
+    pub fn set_lower_bound(&mut self, bound: &[u8]) {
+        self.seek(bound);
     }
 
     pub fn valid(&self) -> bool {
@@ -160,6 +178,13 @@ impl DbIterator {
                     if self.is_range_deleted(&user_key, seq) {
                         self.skip_forward_past_user_key(&user_key);
                         continue;
+                    }
+                    // Check upper bound before returning.
+                    if let Some(ref ub) = self.upper_bound {
+                        if user_key.as_slice() >= ub.as_slice() {
+                            self.valid = false;
+                            return;
+                        }
                     }
                     self.saved_key = user_key;
                     self.saved_value = self.inner.value().to_vec();

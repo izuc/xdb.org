@@ -251,4 +251,9 @@ impl ReadOptions {
 pub struct WriteOptions {
     /// If true, fsync the WAL before returning from the write.
     pub sync: bool,
+    /// If true, skip writing to the WAL. The write is still applied to
+    /// the memtable and will be flushed to an SST, but will be **lost on
+    /// crash** if the memtable hasn't been flushed yet. Useful for
+    /// reconstructible state (e.g., transaction mempool, caches).
+    pub disable_wal: bool,
 }
