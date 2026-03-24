@@ -47,6 +47,7 @@ use std::thread;
 // ---------------------------------------------------------------------------
 
 enum BgWork {
+    Flush,
     MaybeCompact,
     Shutdown,
 }
@@ -166,7 +167,7 @@ impl Db {
             }
 
             for (_num, wal_path) in &wal_files {
-                let _ = fs::remove_file(wal_path);
+                if let Err(e) = fs::remove_file(wal_path) { log::warn!("failed to delete file: {}", e); }
             }
         }
 
@@ -197,13 +198,13 @@ impl Db {
             _lock_file: lock_file,
         });
 
-        // Spawn background compaction thread.
+        // Spawn background thread for compaction and flush.
         let weak = Arc::downgrade(&db);
         let handle = thread::Builder::new()
             .name("xdb-bg".to_string())
             .spawn(move || Self::background_worker(weak, bg_receiver))
-            .ok();
-        *db._bg_handle.lock() = handle;
+            .map_err(Error::Io)?;
+        *db._bg_handle.lock() = Some(handle);
 
         Ok(db)
     }
@@ -412,7 +413,7 @@ impl Db {
         self.do_flush(&mut state)?;
 
         let old_wal_path = self.dbname.join(wal_file_name(old_wal_number));
-        let _ = fs::remove_file(&old_wal_path);
+        if let Err(e) = fs::remove_file(&old_wal_path) { log::warn!("failed to delete file: {}", e); }
 
         Ok(())
     }
@@ -658,6 +659,8 @@ impl Db {
             return Ok(());
         }
 
+        // If there's still an immutable memtable being flushed, we must
+        // wait for it to complete before swapping in another one.
         if state.imm.is_some() {
             self.do_flush(state)?;
         }
@@ -674,10 +677,16 @@ impl Db {
         state.wal = Some(WalWriter::new(wal_file));
         state.versions.set_log_number(wal_number);
 
-        self.do_flush(state)?;
+        // Schedule the flush in the background thread so the write path
+        // returns quickly. The old WAL is cleaned up after flush completes.
+        let _ = self.bg_sender.send(BgWork::Flush);
 
+        // Delete the old WAL (its data is in the immutable memtable and
+        // will be flushed to an SST by the background thread).
         let old_wal_path = self.dbname.join(wal_file_name(old_wal_number));
-        let _ = fs::remove_file(&old_wal_path);
+        if let Err(e) = fs::remove_file(&old_wal_path) {
+            log::warn!("failed to remove old WAL {}: {}", old_wal_number, e);
+        }
 
         Ok(())
     }
@@ -714,7 +723,7 @@ impl Db {
         let file_size = match builder.finish() {
             Ok(size) => size,
             Err(e) => {
-                let _ = fs::remove_file(&sst_path);
+                if let Err(e) = fs::remove_file(&sst_path) { log::warn!("failed to delete file: {}", e); }
                 return Err(e);
             }
         };
@@ -735,12 +744,10 @@ impl Db {
             edit.set_log_number(state.versions.log_number());
             edit.add_file(0, meta);
             if let Err(e) = state.versions.log_and_apply(edit) {
-                let _ = fs::remove_file(&sst_path);
+                if let Err(e) = fs::remove_file(&sst_path) { log::warn!("failed to delete file: {}", e); }
                 return Err(e);
             }
-        } else {
-            let _ = fs::remove_file(&sst_path);
-        }
+        } else if let Err(e) = fs::remove_file(&sst_path) { log::warn!("failed to delete file: {}", e); }
 
         // Fsync the directory to make the new SST file entry durable.
         let _ = self.sync_dir();
@@ -816,6 +823,13 @@ impl Db {
         while let Ok(work) = receiver.recv() {
             match work {
                 BgWork::Shutdown => break,
+                BgWork::Flush => {
+                    if let Some(db) = weak.upgrade() {
+                        if let Err(e) = db.do_background_flush() {
+                            log::error!("background flush failed: {}", e);
+                        }
+                    }
+                }
                 BgWork::MaybeCompact => {
                     if let Some(db) = weak.upgrade() {
                         if let Err(e) = db.do_background_compaction() {
@@ -825,6 +839,13 @@ impl Db {
                 }
             }
         }
+    }
+
+    /// Flush the immutable memtable in the background thread.
+    fn do_background_flush(&self) -> Result<()> {
+        let mut state = self.state.lock();
+        self.do_flush(&mut state)?;
+        Ok(())
     }
 
     /// Run compaction in the background. Releases the lock during I/O.
@@ -906,7 +927,7 @@ impl Db {
             if let Err(e) = apply_result {
                 // Clean up orphaned compaction output files.
                 for f in &comp_state.output_files {
-                    let _ = fs::remove_file(self.dbname.join(sst_file_name(f.number)));
+                    if let Err(e) = fs::remove_file(self.dbname.join(sst_file_name(f.number))) { log::warn!("failed to delete file: {}", e); }
                 }
                 return Err(e);
             }
@@ -915,7 +936,7 @@ impl Db {
             for files in &comp_state.input_files {
                 for f in files {
                     self.table_cache.evict(f.number);
-                    let _ = fs::remove_file(self.dbname.join(sst_file_name(f.number)));
+                    if let Err(e) = fs::remove_file(self.dbname.join(sst_file_name(f.number))) { log::warn!("failed to delete file: {}", e); }
                 }
             }
 
@@ -972,7 +993,7 @@ impl Db {
         let file_size = match builder.finish() {
             Ok(size) => size,
             Err(e) => {
-                let _ = fs::remove_file(&sst_path);
+                if let Err(e) = fs::remove_file(&sst_path) { log::warn!("failed to delete file: {}", e); }
                 return Err(e);
             }
         };
@@ -988,9 +1009,7 @@ impl Db {
             edit.set_log_number(versions.log_number());
             edit.add_file(0, meta);
             versions.log_and_apply(edit)?;
-        } else {
-            let _ = fs::remove_file(&sst_path);
-        }
+        } else if let Err(e) = fs::remove_file(&sst_path) { log::warn!("failed to delete file: {}", e); }
 
         Ok(())
     }
