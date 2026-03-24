@@ -138,7 +138,7 @@ impl SkipList {
     fn find_greater_or_equal(
         &self,
         target: &[u8],
-        prev: Option<&mut [*mut Node; MAX_HEIGHT]>,
+        mut prev: Option<&mut [*mut Node; MAX_HEIGHT]>,
     ) -> *mut Node {
         let mut current = self.head;
         let mut level = self.current_height() - 1;
@@ -148,17 +148,10 @@ impl SkipList {
             if !next.is_null()
                 && compare_internal_key(unsafe { &(*next).key }, target) == std::cmp::Ordering::Less
             {
-                // next key < target — keep going right
                 current = next;
             } else {
-                // Record predecessor at this level.
-                if let Some(p) = &prev {
-                    // SAFETY: we have exclusive access to the prev array during insert.
-                    unsafe {
-                        let p_ptr = *p as *const [*mut Node; MAX_HEIGHT]
-                            as *mut [*mut Node; MAX_HEIGHT];
-                        (*p_ptr)[level] = current;
-                    }
+                if let Some(ref mut p) = prev {
+                    p[level] = current;
                 }
                 if level == 0 {
                     return next;

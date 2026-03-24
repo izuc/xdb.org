@@ -397,12 +397,14 @@ impl Db {
             return Ok(());
         }
 
-        let old_mem = std::mem::replace(&mut state.mem, Arc::new(MemTable::new()));
-        state.imm = Some(old_mem);
-
+        // Create the new WAL file BEFORE swapping memtables, so that an
+        // I/O failure (e.g., "too many open files") leaves state untouched.
         let wal_number = state.versions.new_file_number();
         let wal_path = self.dbname.join(wal_file_name(wal_number));
         let wal_file = fs::File::create(&wal_path)?;
+
+        let old_mem = std::mem::replace(&mut state.mem, Arc::new(MemTable::new()));
+        state.imm = Some(old_mem);
         let old_wal_number = state.versions.log_number();
         state.wal = Some(WalWriter::new(wal_file));
         state.versions.set_log_number(wal_number);
@@ -484,6 +486,15 @@ impl Db {
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    /// Fsync the database directory to ensure newly created files (WAL, SST)
+    /// are durable in the directory listing. Without this, a crash could
+    /// cause a successfully written file to vanish from the directory.
+    fn sync_dir(&self) -> Result<()> {
+        let dir = fs::File::open(&self.dbname)?;
+        dir.sync_all()?;
+        Ok(())
+    }
 
     /// Build a DbIterator at a given sequence number.
     fn iter_at_sequence(&self, sequence: SequenceNumber) -> DbIterator {
@@ -651,12 +662,14 @@ impl Db {
             self.do_flush(state)?;
         }
 
-        let old_mem = std::mem::replace(&mut state.mem, Arc::new(MemTable::new()));
-        state.imm = Some(old_mem);
-
+        // Create the new WAL BEFORE swapping memtables so an I/O failure
+        // (e.g., fd exhaustion) doesn't leave state inconsistent.
         let wal_number = state.versions.new_file_number();
         let wal_path = self.dbname.join(wal_file_name(wal_number));
         let wal_file = fs::File::create(&wal_path)?;
+
+        let old_mem = std::mem::replace(&mut state.mem, Arc::new(MemTable::new()));
+        state.imm = Some(old_mem);
         let old_wal_number = state.versions.log_number();
         state.wal = Some(WalWriter::new(wal_file));
         state.versions.set_log_number(wal_number);
@@ -728,6 +741,9 @@ impl Db {
         } else {
             let _ = fs::remove_file(&sst_path);
         }
+
+        // Fsync the directory to make the new SST file entry durable.
+        let _ = self.sync_dir();
 
         Statistics::record(&self.stats.flushes, 1);
 
@@ -903,7 +919,19 @@ impl Db {
                 }
             }
 
+            // Fsync directory after compaction creates new files.
+            let _ = self.sync_dir();
+
             // Loop to check if more compaction is needed.
+        }
+
+        // If we hit the round limit and there's still work, re-schedule
+        // so the background thread picks it up on the next iteration.
+        if !self.shutting_down.load(AtomicOrdering::Acquire) {
+            let state = self.state.lock();
+            if state.versions.pick_compaction().is_some() {
+                let _ = self.bg_sender.send(BgWork::MaybeCompact);
+            }
         }
 
         Ok(())
