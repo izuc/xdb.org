@@ -157,6 +157,9 @@ pub struct VersionSet {
     manifest_file_number: FileNumber,
     /// Writer for the current MANIFEST file (lazily opened).
     manifest_writer: Option<ManifestWriter>,
+    /// Approximate bytes written to the current MANIFEST (tracked in memory
+    /// to avoid platform-dependent fs::metadata issues with BufWriter).
+    manifest_bytes_written: u64,
 }
 
 impl VersionSet {
@@ -175,6 +178,7 @@ impl VersionSet {
             log_number: 0,
             manifest_file_number: 1,
             manifest_writer: None,
+            manifest_bytes_written: 0,
         }
     }
 
@@ -197,7 +201,9 @@ impl VersionSet {
             self.write_snapshot()?;
         }
 
-        // Write the edit to the MANIFEST.
+        // Write the edit to the MANIFEST and track bytes written.
+        let encoded = edit.encode();
+        self.manifest_bytes_written += encoded.len() as u64;
         let writer = self.manifest_writer.as_mut().unwrap();
         writer.add_edit(&edit)?;
 
@@ -396,9 +402,10 @@ impl VersionSet {
     /// Creates a new MANIFEST with a full snapshot and updates CURRENT.
     /// The old MANIFEST is deleted (best effort).
     fn maybe_rotate_manifest(&mut self) -> Result<()> {
-        let manifest_path = self.dbname.join(manifest_file_name(self.manifest_file_number));
-        let size = fs::metadata(&manifest_path).map(|m| m.len()).unwrap_or(0);
-        if size < MAX_MANIFEST_SIZE {
+        // Use in-memory byte counter instead of fs::metadata to avoid
+        // platform issues with BufWriter buffering (e.g., Windows metadata
+        // not reflecting unflushed data).
+        if self.manifest_bytes_written < MAX_MANIFEST_SIZE {
             return Ok(());
         }
 
@@ -446,6 +453,7 @@ impl VersionSet {
 
         writer.add_edit(&edit)?;
         self.manifest_writer = Some(writer);
+        self.manifest_bytes_written = edit.encode().len() as u64;
 
         // Update the CURRENT file to point to this MANIFEST.
         self.set_current_file(&manifest_name)?;

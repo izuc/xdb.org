@@ -895,21 +895,30 @@ impl Db {
     // -----------------------------------------------------------------------
 
     /// Background worker loop: receives work items and processes them.
+    /// Panics in flush/compaction are caught so the thread stays alive.
     fn background_worker(weak: Weak<Db>, receiver: crossbeam_channel::Receiver<BgWork>) {
         while let Ok(work) = receiver.recv() {
             match work {
                 BgWork::Shutdown => break,
                 BgWork::Flush => {
                     if let Some(db) = weak.upgrade() {
-                        if let Err(e) = db.do_background_flush() {
-                            log::error!("background flush failed: {}", e);
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            db.do_background_flush()
+                        })) {
+                            Ok(Err(e)) => log::error!("background flush failed: {}", e),
+                            Err(_) => log::error!("background flush panicked"),
+                            _ => {}
                         }
                     }
                 }
                 BgWork::MaybeCompact => {
                     if let Some(db) = weak.upgrade() {
-                        if let Err(e) = db.do_background_compaction() {
-                            log::error!("background compaction failed: {}", e);
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            db.do_background_compaction()
+                        })) {
+                            Ok(Err(e)) => log::error!("background compaction failed: {}", e),
+                            Err(_) => log::error!("background compaction panicked"),
+                            _ => {}
                         }
                     }
                 }
