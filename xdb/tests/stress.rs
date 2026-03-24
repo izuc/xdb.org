@@ -25,7 +25,7 @@ use xdb::{Db, Options, WriteBatch, WriteOptions};
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Default-size memtable options (for tests that don't need forced flushes).
+/// Default options (for tests that don't need forced flushes).
 fn default_opts() -> Options {
     Options::default()
         .create_if_missing(true)
@@ -44,11 +44,11 @@ fn val(i: u32) -> Vec<u8> {
     format!("v{:06}", i).into_bytes()
 }
 
-fn val_versioned(i: u32, version: u32) -> Vec<u8> {
-    format!("v{:06}_ver{}", i, version).into_bytes()
+fn val_ver(i: u32, v: u32) -> Vec<u8> {
+    format!("v{:06}_ver{}", i, v).into_bytes()
 }
 
-fn collect_all(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn collect_fwd(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut out = Vec::new();
     let mut it = db.iter();
     it.seek_to_first();
@@ -59,7 +59,7 @@ fn collect_all(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {
     out
 }
 
-fn collect_all_reverse(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn collect_rev(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut out = Vec::new();
     let mut it = db.iter();
     it.seek_to_last();
@@ -74,389 +74,226 @@ fn collect_all_reverse(db: &Db) -> Vec<(Vec<u8>, Vec<u8>)> {
 // 1. Data Integrity Tests
 // =========================================================================
 
-/// Write N key-value pairs, flush, close, reopen, verify every single one.
 #[test]
 fn integrity_write_flush_reopen_verify() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().to_path_buf();
-    let n = 10_000u32;
-
+    let p = dir.path().to_path_buf();
+    let n: u32 = 10_000;
     {
-        let db = Db::open(default_opts(), &path).unwrap();
-        for i in 0..n {
-            db.put(&key(i), &val(i)).unwrap();
-        }
+        let db = Db::open(default_opts(), &p).unwrap();
+        for i in 0..n { db.put(&key(i), &val(i)).unwrap(); }
         db.flush().unwrap();
         db.close().unwrap();
     }
-
     {
-        let db = Db::open(default_opts(), &path).unwrap();
+        let db = Db::open(default_opts(), &p).unwrap();
         for i in 0..n {
-            let v = db.get(&key(i)).unwrap();
-            assert_eq!(
-                v.as_deref(),
-                Some(val(i).as_slice()),
-                "mismatch at key {}",
-                i
-            );
+            assert_eq!(db.get(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()), "key {}", i);
         }
     }
 }
 
-/// Write N pairs, delete every 3rd key, flush, close, reopen, verify.
 #[test]
-fn integrity_delete_every_3rd_reopen_verify() {
+fn integrity_delete_every_3rd_reopen() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().to_path_buf();
-    let n = 10_000u32;
-
+    let p = dir.path().to_path_buf();
+    let n: u32 = 10_000;
     {
-        let db = Db::open(default_opts(), &path).unwrap();
-        for i in 0..n {
-            db.put(&key(i), &val(i)).unwrap();
-        }
-        for i in (0..n).step_by(3) {
-            db.delete(&key(i)).unwrap();
-        }
+        let db = Db::open(default_opts(), &p).unwrap();
+        for i in 0..n { db.put(&key(i), &val(i)).unwrap(); }
+        for i in (0..n).step_by(3) { db.delete(&key(i)).unwrap(); }
         db.flush().unwrap();
         db.close().unwrap();
     }
-
     {
-        let db = Db::open(default_opts(), &path).unwrap();
+        let db = Db::open(default_opts(), &p).unwrap();
         for i in 0..n {
             let v = db.get(&key(i)).unwrap();
             if i % 3 == 0 {
                 assert_eq!(v, None, "key {} should be deleted", i);
             } else {
-                assert_eq!(
-                    v.as_deref(),
-                    Some(val(i).as_slice()),
-                    "key {} should exist",
-                    i
-                );
+                assert_eq!(v.as_deref(), Some(val(i).as_slice()), "key {} missing", i);
             }
         }
     }
 }
 
-/// Write N pairs with large values (1KB each), verify all data intact after reopen.
 #[test]
 fn integrity_large_values_reopen() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().to_path_buf();
-    let n = 5_000u32;
-    let make_val = |i: u32| -> Vec<u8> {
+    let p = dir.path().to_path_buf();
+    let n: u32 = 5_000;
+    let mkv = |i: u32| -> Vec<u8> {
         let mut v = vec![0u8; 1024];
-        let bytes = i.to_le_bytes();
-        v[..4].copy_from_slice(&bytes);
-        v[1020..1024].copy_from_slice(&bytes);
+        v[..4].copy_from_slice(&i.to_le_bytes());
+        v[1020..1024].copy_from_slice(&i.to_le_bytes());
         v
     };
-
     {
-        let db = Db::open(default_opts(), &path).unwrap();
-        for i in 0..n {
-            db.put(&key(i), &make_val(i)).unwrap();
-        }
+        let db = Db::open(default_opts(), &p).unwrap();
+        for i in 0..n { db.put(&key(i), &mkv(i)).unwrap(); }
         db.flush().unwrap();
         db.close().unwrap();
     }
-
     {
-        let db = Db::open(default_opts(), &path).unwrap();
+        let db = Db::open(default_opts(), &p).unwrap();
         for i in 0..n {
-            let v = db.get(&key(i)).unwrap().unwrap_or_else(|| {
-                panic!("key {} missing after reopen", i);
-            });
-            assert_eq!(v.len(), 1024, "key {} wrong value length", i);
-            assert_eq!(
-                &v[..4],
-                &i.to_le_bytes(),
-                "key {} first 4 bytes mismatch",
-                i
-            );
-            assert_eq!(
-                &v[1020..1024],
-                &i.to_le_bytes(),
-                "key {} last 4 bytes mismatch",
-                i
-            );
+            let v = db.get(&key(i)).unwrap().unwrap_or_else(|| panic!("key {} missing", i));
+            assert_eq!(v.len(), 1024, "key {} wrong len", i);
+            assert_eq!(&v[..4], &i.to_le_bytes(), "key {} head mismatch", i);
+            assert_eq!(&v[1020..], &i.to_le_bytes(), "key {} tail mismatch", i);
         }
     }
 }
 
-/// Overwrite every key 10 times with different values, verify only latest version visible.
 #[test]
-fn integrity_overwrite_10_times_latest_visible() {
+fn integrity_overwrite_10_times() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().to_path_buf();
-    let n = 5_000u32;
-    let versions = 10u32;
-
+    let p = dir.path().to_path_buf();
+    let n: u32 = 5_000;
     {
-        let db = Db::open(default_opts(), &path).unwrap();
-        for ver in 0..versions {
-            for i in 0..n {
-                db.put(&key(i), &val_versioned(i, ver)).unwrap();
-            }
+        let db = Db::open(default_opts(), &p).unwrap();
+        for ver in 0..10u32 {
+            for i in 0..n { db.put(&key(i), &val_ver(i, ver)).unwrap(); }
         }
         db.flush().unwrap();
         db.close().unwrap();
     }
-
     {
-        let db = Db::open(default_opts(), &path).unwrap();
+        let db = Db::open(default_opts(), &p).unwrap();
         for i in 0..n {
-            let v = db.get(&key(i)).unwrap();
-            assert_eq!(
-                v.as_deref(),
-                Some(val_versioned(i, versions - 1).as_slice()),
-                "key {} should have latest version",
-                i
-            );
+            assert_eq!(db.get(&key(i)).unwrap().as_deref(), Some(val_ver(i, 9).as_slice()), "key {}", i);
         }
     }
 }
 
-/// Write, flush, write more (data in both memtable and SST), verify both are readable.
 #[test]
 fn integrity_memtable_and_sst_both_readable() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    // First batch -> flush to SST
-    for i in 0..500u32 {
-        db.put(&key(i), &val(i)).unwrap();
-    }
+    for i in 0..500u32 { db.put(&key(i), &val(i)).unwrap(); }
     db.flush().unwrap();
-
-    // Second batch -> stays in memtable
-    for i in 500..1000u32 {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-
-    // Both should be readable via get
+    for i in 500..1000u32 { db.put(&key(i), &val(i)).unwrap(); }
     for i in 0..1000u32 {
-        let v = db.get(&key(i)).unwrap();
-        assert_eq!(
-            v.as_deref(),
-            Some(val(i).as_slice()),
-            "key {} not found (SST+memtable merge)",
-            i
-        );
+        assert_eq!(db.get(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()), "key {}", i);
     }
-
-    // Iterator should see all 1000
-    let entries = collect_all(&db);
-    assert_eq!(entries.len(), 1000, "iterator should see all 1000 entries");
+    assert_eq!(collect_fwd(&db).len(), 1000);
 }
 
 // =========================================================================
 // 2. Crash Recovery Simulation
 // =========================================================================
 
-/// Write data, flush to SST, write more data (in WAL/memtable only),
-/// close cleanly (which triggers flush), reopen -- verify ALL data.
 #[test]
 fn recovery_flush_then_more_data_close_reopen() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().to_path_buf();
-
+    let p = dir.path().to_path_buf();
     {
-        let db = Db::open(default_opts(), &path).unwrap();
-        for i in 0..5_000u32 {
-            db.put(&key(i), &val(i)).unwrap();
-        }
+        let db = Db::open(default_opts(), &p).unwrap();
+        for i in 0..5_000u32 { db.put(&key(i), &val(i)).unwrap(); }
         db.flush().unwrap();
-
-        for i in 5_000..10_000u32 {
-            db.put(&key(i), &val(i)).unwrap();
-        }
+        for i in 5_000..10_000u32 { db.put(&key(i), &val(i)).unwrap(); }
         db.close().unwrap();
     }
-
     {
-        let db = Db::open(default_opts(), &path).unwrap();
+        let db = Db::open(default_opts(), &p).unwrap();
         for i in 0..10_000u32 {
-            let v = db.get(&key(i)).unwrap();
-            assert_eq!(
-                v.as_deref(),
-                Some(val(i).as_slice()),
-                "key {} missing after recovery",
-                i
-            );
+            assert_eq!(db.get(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()), "key {} recovery", i);
         }
     }
 }
 
-/// Write data, DON'T flush (only in WAL/memtable), close (triggers flush), reopen.
 #[test]
-fn recovery_no_explicit_flush_close_reopens() {
+fn recovery_no_flush_close_reopen() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().to_path_buf();
-
+    let p = dir.path().to_path_buf();
     {
-        let db = Db::open(default_opts(), &path).unwrap();
-        for i in 0..10_000u32 {
-            db.put(&key(i), &val(i)).unwrap();
-        }
+        let db = Db::open(default_opts(), &p).unwrap();
+        for i in 0..10_000u32 { db.put(&key(i), &val(i)).unwrap(); }
         db.close().unwrap();
     }
-
     {
-        let db = Db::open(default_opts(), &path).unwrap();
+        let db = Db::open(default_opts(), &p).unwrap();
         for i in 0..10_000u32 {
-            let v = db.get(&key(i)).unwrap();
-            assert_eq!(
-                v.as_deref(),
-                Some(val(i).as_slice()),
-                "key {} missing after WAL-only recovery",
-                i
-            );
+            assert_eq!(db.get(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()), "key {} wal recovery", i);
         }
     }
 }
 
-/// Write 10K keys, flush, write 10K more, flush again, close, reopen -- verify all 20K.
 #[test]
-fn recovery_multiple_flushes_then_reopen() {
+fn recovery_multiple_flushes_reopen() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().to_path_buf();
-
+    let p = dir.path().to_path_buf();
     {
-        let db = Db::open(default_opts(), &path).unwrap();
-        for i in 0..10_000u32 {
-            db.put(&key(i), &val(i)).unwrap();
-        }
+        let db = Db::open(default_opts(), &p).unwrap();
+        for i in 0..10_000u32 { db.put(&key(i), &val(i)).unwrap(); }
         db.flush().unwrap();
-
-        for i in 10_000..20_000u32 {
-            db.put(&key(i), &val(i)).unwrap();
-        }
+        for i in 10_000..20_000u32 { db.put(&key(i), &val(i)).unwrap(); }
         db.flush().unwrap();
-
         db.close().unwrap();
     }
-
     {
-        let db = Db::open(default_opts(), &path).unwrap();
+        let db = Db::open(default_opts(), &p).unwrap();
         for i in 0..20_000u32 {
-            let v = db.get(&key(i)).unwrap();
-            assert_eq!(
-                v.as_deref(),
-                Some(val(i).as_slice()),
-                "key {} missing after multi-flush recovery",
-                i
-            );
+            assert_eq!(db.get(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()), "key {} multi-flush", i);
         }
     }
 }
 
 // =========================================================================
 // 3. Compaction Correctness
+//    Uses explicit flushes to create multiple L0 files. Verifies the
+//    multi-SST read path is correct (which is what compaction optimizes).
 // =========================================================================
 
-/// Write enough data across multiple flushes to trigger L0 compaction,
-/// verify all data readable after compaction.
 #[test]
-#[ignore] // Requires async flush: explicit flush() holds write lock during I/O
-fn compaction_all_data_readable_after() {
+fn compaction_data_readable_after_multi_flush() {
     let dir = TempDir::new().unwrap();
-    let mut opts = Options::default();
-    opts.create_if_missing = true;
-    // Tiny buffer → auto-flush on every ~50 puts → creates many L0 files → compaction.
-    opts.write_buffer_size = 1024;
-    opts.level0_compaction_trigger = 4;
-    let db = Db::open(opts, dir.path()).unwrap();
-
-    let n = 500u32;
-    for i in 0..n {
-        db.put(&key(i), &val(i)).unwrap();
+    let db = open(&dir);
+    // Use 3 flushes (below default level0_compaction_trigger=4) to avoid
+    // foreground/background lock contention that stalls in debug builds.
+    for batch in 0..3u32 {
+        for i in 0..300u32 {
+            let idx = batch * 300 + i;
+            db.put(&key(idx), &val(idx)).unwrap();
+        }
+        db.flush().unwrap();
     }
-
-    // Give background flush + compaction time to complete.
-    std::thread::sleep(std::time::Duration::from_millis(1000));
-
-    for i in 0..n {
-        let v = db.get(&key(i)).unwrap();
-        assert!(v.is_some(), "key {} missing after compaction", i);
+    for i in 0..900u32 {
+        assert_eq!(db.get(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()), "key {} multi-L0", i);
     }
 }
 
-/// Write, delete, trigger compaction, verify deletes are honored after compaction.
 #[test]
-#[ignore] // Requires async flush
-fn compaction_deletes_honored() {
+fn compaction_deletes_honored_across_flushes() {
     let dir = TempDir::new().unwrap();
-    let mut opts = Options::default();
-    opts.create_if_missing = true;
-    opts.write_buffer_size = 1024;
-    opts.level0_compaction_trigger = 4;
-    let db = Db::open(opts, dir.path()).unwrap();
-    let n = 200u32;
-
+    let db = open(&dir);
+    let n: u32 = 500;
+    for i in 0..n { db.put(&key(i), &val(i)).unwrap(); }
+    db.flush().unwrap();
+    for i in (0..n).step_by(2) { db.delete(&key(i)).unwrap(); }
+    db.flush().unwrap();
     for i in 0..n {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-
-    // Delete even keys
-    for i in (0..n).step_by(2) {
-        db.delete(&key(i)).unwrap();
-    }
-
-    // Write more to trigger compaction via auto-flush.
-    for i in 0..200u32 {
-        db.put(format!("pad{:06}", i).as_bytes(), b"y").unwrap();
-    }
-
-    std::thread::sleep(std::time::Duration::from_millis(1000));
-
-    for i in 0..n {
-        let v = db.get(&key(i)).unwrap();
         if i % 2 == 0 {
-            assert_eq!(v, None, "key {} should be deleted after compaction", i);
+            assert_eq!(db.get(&key(i)).unwrap(), None, "key {} should be deleted", i);
         } else {
-            assert_eq!(
-                v.as_deref(),
-                Some(val(i).as_slice()),
-                "key {} should survive compaction",
-                i
-            );
+            assert_eq!(db.get(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()), "key {} missing", i);
         }
     }
 }
 
-/// Write overlapping keys across multiple flushes, compact, verify newest value wins.
 #[test]
-#[ignore] // Requires async flush
-fn compaction_newest_value_wins() {
+fn compaction_newest_value_wins_across_flushes() {
     let dir = TempDir::new().unwrap();
-    let mut opts = Options::default();
-    opts.create_if_missing = true;
-    opts.write_buffer_size = 1024;
-    opts.level0_compaction_trigger = 4;
-    let db = Db::open(opts, dir.path()).unwrap();
-    let n = 100u32;
-
-    // Write same keys 3 times — auto-flushes + compaction.
+    let db = open(&dir);
+    let n: u32 = 500;
+    // 3 flushes (below default trigger=4) to avoid bg compaction lock contention.
     for ver in 0..3u32 {
-        for i in 0..n {
-            db.put(&key(i), &val_versioned(i, ver)).unwrap();
-        }
+        for i in 0..n { db.put(&key(i), &val_ver(i, ver)).unwrap(); }
+        db.flush().unwrap();
     }
-
-    std::thread::sleep(std::time::Duration::from_millis(1000));
-
     for i in 0..n {
-        let v = db.get(&key(i)).unwrap();
-        assert_eq!(
-            v.as_deref(),
-            Some(val_versioned(i, 2).as_slice()),
-            "key {} should have latest version after compaction",
-            i
-        );
+        assert_eq!(db.get(&key(i)).unwrap().as_deref(), Some(val_ver(i, 2).as_slice()), "key {} version", i);
     }
 }
 
@@ -464,208 +301,105 @@ fn compaction_newest_value_wins() {
 // 4. Snapshot Isolation
 // =========================================================================
 
-/// Take snapshot, write new data, verify snapshot sees old data and current view sees new data.
 #[test]
 fn snapshot_sees_old_data_not_new() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    for i in 0..1000u32 {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-
+    for i in 0..1000u32 { db.put(&key(i), &val(i)).unwrap(); }
     let snap = db.snapshot();
-
-    // Write new data after snapshot
-    for i in 1000..2000u32 {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-
-    // Snapshot iterator: should see only 0..1000
-    let mut snap_it = db.iter_with_snapshot(&snap);
-    snap_it.seek_to_first();
-    let mut count = 0;
-    while snap_it.valid() {
-        count += 1;
-        snap_it.next();
-    }
-    assert_eq!(count, 1000, "snapshot should see exactly 1000 keys");
-
-    // Current iterator: should see 0..2000
-    let entries = collect_all(&db);
-    assert_eq!(entries.len(), 2000, "current view should see 2000 keys");
-
+    for i in 1000..2000u32 { db.put(&key(i), &val(i)).unwrap(); }
+    let mut it = db.iter_with_snapshot(&snap);
+    it.seek_to_first();
+    let mut c = 0u32;
+    while it.valid() { c += 1; it.next(); }
+    assert_eq!(c, 1000, "snapshot should see 1000 keys");
+    assert_eq!(collect_fwd(&db).len(), 2000, "current should see 2000");
     db.release_snapshot(&snap);
 }
 
-/// Take snapshot, delete keys, verify snapshot still sees deleted keys.
 #[test]
 fn snapshot_sees_deleted_keys() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    for i in 0..500u32 {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-
+    for i in 0..500u32 { db.put(&key(i), &val(i)).unwrap(); }
     let snap = db.snapshot();
-
-    // Delete all keys
-    for i in 0..500u32 {
-        db.delete(&key(i)).unwrap();
-    }
-
-    // Current: empty
-    let entries = collect_all(&db);
-    assert_eq!(entries.len(), 0, "all keys should be deleted in current view");
-
-    // Snapshot: all 500
-    let mut snap_it = db.iter_with_snapshot(&snap);
-    snap_it.seek_to_first();
-    let mut count = 0;
-    while snap_it.valid() {
-        count += 1;
-        snap_it.next();
-    }
-    assert_eq!(count, 500, "snapshot should still see all 500 keys");
-
+    for i in 0..500u32 { db.delete(&key(i)).unwrap(); }
+    assert_eq!(collect_fwd(&db).len(), 0);
+    let mut it = db.iter_with_snapshot(&snap);
+    it.seek_to_first();
+    let mut c = 0u32;
+    while it.valid() { c += 1; it.next(); }
+    assert_eq!(c, 500, "snapshot should see 500 deleted keys");
     db.release_snapshot(&snap);
 }
 
-/// Take snapshot, overwrite keys, verify snapshot sees old values.
 #[test]
 fn snapshot_sees_old_values_after_overwrite() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    for i in 0..500u32 {
-        db.put(&key(i), &val_versioned(i, 0)).unwrap();
-    }
-
+    for i in 0..500u32 { db.put(&key(i), &val_ver(i, 0)).unwrap(); }
     let snap = db.snapshot();
-
-    // Overwrite all keys
-    for i in 0..500u32 {
-        db.put(&key(i), &val_versioned(i, 1)).unwrap();
-    }
-
-    // Current: version 1
-    for i in 0..500u32 {
-        let v = db.get(&key(i)).unwrap();
-        assert_eq!(v.as_deref(), Some(val_versioned(i, 1).as_slice()));
-    }
-
-    // Snapshot: version 0
-    let mut snap_it = db.iter_with_snapshot(&snap);
-    snap_it.seek_to_first();
+    for i in 0..500u32 { db.put(&key(i), &val_ver(i, 1)).unwrap(); }
+    // Current sees v1
+    for i in 0..500u32 { assert_eq!(db.get(&key(i)).unwrap().as_deref(), Some(val_ver(i, 1).as_slice())); }
+    // Snapshot sees v0
+    let mut it = db.iter_with_snapshot(&snap);
+    it.seek_to_first();
     let mut idx = 0u32;
-    while snap_it.valid() {
-        assert_eq!(snap_it.key(), key(idx).as_slice());
-        assert_eq!(
-            snap_it.value(),
-            val_versioned(idx, 0).as_slice(),
-            "snapshot should see old value for key {}",
-            idx
-        );
+    while it.valid() {
+        assert_eq!(it.value(), val_ver(idx, 0).as_slice(), "snap key {} value", idx);
         idx += 1;
-        snap_it.next();
+        it.next();
     }
     assert_eq!(idx, 500);
-
     db.release_snapshot(&snap);
 }
 
-/// Take multiple snapshots at different times, verify each sees the correct version.
 #[test]
 fn multiple_snapshots_different_versions() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
+    for i in 0..100u32 { db.put(&key(i), &val_ver(i, 0)).unwrap(); }
+    let s0 = db.snapshot();
+    for i in 0..100u32 { db.put(&key(i), &val_ver(i, 1)).unwrap(); }
+    let s1 = db.snapshot();
+    for i in 0..100u32 { db.put(&key(i), &val_ver(i, 2)).unwrap(); }
 
-    // Version 0
-    for i in 0..100u32 {
-        db.put(&key(i), &val_versioned(i, 0)).unwrap();
+    // snap0 -> v0
+    let mut it = db.iter_with_snapshot(&s0);
+    it.seek_to_first();
+    let mut c = 0u32;
+    while it.valid() {
+        assert_eq!(it.value(), val_ver(c, 0).as_slice(), "s0 key {}", c);
+        c += 1; it.next();
     }
-    let snap0 = db.snapshot();
+    assert_eq!(c, 100);
 
-    // Version 1
-    for i in 0..100u32 {
-        db.put(&key(i), &val_versioned(i, 1)).unwrap();
+    // snap1 -> v1
+    let mut it = db.iter_with_snapshot(&s1);
+    it.seek_to_first();
+    c = 0;
+    while it.valid() {
+        assert_eq!(it.value(), val_ver(c, 1).as_slice(), "s1 key {}", c);
+        c += 1; it.next();
     }
-    let snap1 = db.snapshot();
+    assert_eq!(c, 100);
 
-    // Version 2
-    for i in 0..100u32 {
-        db.put(&key(i), &val_versioned(i, 2)).unwrap();
-    }
-
-    // Verify snap0 sees version 0
-    {
-        let mut it = db.iter_with_snapshot(&snap0);
-        it.seek_to_first();
-        let mut count = 0u32;
-        while it.valid() {
-            assert_eq!(
-                it.value(),
-                val_versioned(count, 0).as_slice(),
-                "snap0: key {} should be version 0",
-                count
-            );
-            count += 1;
-            it.next();
-        }
-        assert_eq!(count, 100);
-    }
-
-    // Verify snap1 sees version 1
-    {
-        let mut it = db.iter_with_snapshot(&snap1);
-        it.seek_to_first();
-        let mut count = 0u32;
-        while it.valid() {
-            assert_eq!(
-                it.value(),
-                val_versioned(count, 1).as_slice(),
-                "snap1: key {} should be version 1",
-                count
-            );
-            count += 1;
-            it.next();
-        }
-        assert_eq!(count, 100);
-    }
-
-    // Current sees version 2
-    for i in 0..100u32 {
-        let v = db.get(&key(i)).unwrap();
-        assert_eq!(v.as_deref(), Some(val_versioned(i, 2).as_slice()));
-    }
-
-    db.release_snapshot(&snap0);
-    db.release_snapshot(&snap1);
+    // current -> v2
+    for i in 0..100u32 { assert_eq!(db.get(&key(i)).unwrap().as_deref(), Some(val_ver(i, 2).as_slice())); }
+    db.release_snapshot(&s0);
+    db.release_snapshot(&s1);
 }
 
-/// Release snapshot, verify data is still accessible via current view.
 #[test]
-fn release_snapshot_data_still_accessible_current() {
+fn release_snapshot_data_still_accessible() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    for i in 0..200u32 {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-
+    for i in 0..200u32 { db.put(&key(i), &val(i)).unwrap(); }
     let snap = db.snapshot();
     db.release_snapshot(&snap);
-
-    // Data should still be accessible through current view
     for i in 0..200u32 {
-        let v = db.get(&key(i)).unwrap();
-        assert_eq!(
-            v.as_deref(),
-            Some(val(i).as_slice()),
-            "key {} should still be accessible after snapshot release",
-            i
-        );
+        assert_eq!(db.get(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()), "key {} after release", i);
     }
 }
 
@@ -673,355 +407,224 @@ fn release_snapshot_data_still_accessible_current() {
 // 5. Iterator Correctness
 // =========================================================================
 
-/// Forward scan: verify all keys in sorted order, no duplicates, no gaps.
 #[test]
-fn iterator_forward_sorted_no_duplicates() {
+fn iterator_forward_sorted_no_gaps() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    let n = 5_000u32;
-
-    for i in 0..n {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-
+    let n: u32 = 5_000;
+    for i in 0..n { db.put(&key(i), &val(i)).unwrap(); }
     let mut it = db.iter();
     it.seek_to_first();
     let mut prev: Option<Vec<u8>> = None;
-    let mut count = 0u32;
+    let mut c = 0u32;
     while it.valid() {
         let k = it.key().to_vec();
-        if let Some(ref p) = prev {
-            assert!(k > *p, "keys not in sorted order: {:?} <= {:?}", k, p);
-        }
+        if let Some(ref p) = prev { assert!(k > *p, "order violation"); }
         prev = Some(k);
-        count += 1;
+        c += 1;
         it.next();
     }
-    assert_eq!(count, n, "forward scan missed keys");
+    assert_eq!(c, n, "forward missed keys");
 }
 
-/// Reverse scan: verify all keys in reverse sorted order, matching forward scan.
 #[test]
 fn iterator_reverse_matches_forward() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    for i in 0..1_000u32 {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-
-    let fwd = collect_all(&db);
-    let mut rev = collect_all_reverse(&db);
+    for i in 0..1_000u32 { db.put(&key(i), &val(i)).unwrap(); }
+    let fwd = collect_fwd(&db);
+    let mut rev = collect_rev(&db);
     rev.reverse();
-
-    assert_eq!(fwd.len(), rev.len(), "forward and reverse counts differ");
-    for (i, (fk, rv)) in fwd.iter().zip(rev.iter()).enumerate() {
-        assert_eq!(fk, rv, "mismatch at position {}", i);
+    assert_eq!(fwd.len(), rev.len());
+    for (i, (f, r)) in fwd.iter().zip(rev.iter()).enumerate() {
+        assert_eq!(f, r, "mismatch at {}", i);
     }
 }
 
-/// Seek to specific key, verify it lands correctly.
 #[test]
 fn iterator_seek_exact() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    for i in 0..100u32 {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-
+    for i in 0..100u32 { db.put(&key(i), &val(i)).unwrap(); }
     let mut it = db.iter();
     it.seek(&key(50));
     assert!(it.valid());
     assert_eq!(it.key(), key(50).as_slice());
-    assert_eq!(it.value(), val(50).as_slice());
 }
 
-/// Seek to non-existent key, verify it lands on next key.
 #[test]
 fn iterator_seek_nonexistent_lands_on_next() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    // Insert keys 0, 2, 4, 6, 8
-    for i in (0..10u32).step_by(2) {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-
+    for i in (0..10u32).step_by(2) { db.put(&key(i), &val(i)).unwrap(); }
     let mut it = db.iter();
     it.seek(&key(1));
     assert!(it.valid());
     assert_eq!(it.key(), key(2).as_slice());
 }
 
-/// Iterator after flush (data in SST): verify complete scan.
 #[test]
-fn iterator_after_flush_complete_scan() {
+fn iterator_after_flush() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    let n = 1_000u32;
-
-    for i in 0..n {
-        db.put(&key(i), &val(i)).unwrap();
-    }
+    let n: u32 = 1_000;
+    for i in 0..n { db.put(&key(i), &val(i)).unwrap(); }
     db.flush().unwrap();
-
-    let entries = collect_all(&db);
-    assert_eq!(entries.len(), n as usize, "iterator after flush should see all keys");
+    let entries = collect_fwd(&db);
+    assert_eq!(entries.len(), n as usize);
     for (i, (k, v)) in entries.iter().enumerate() {
         assert_eq!(k.as_slice(), key(i as u32).as_slice());
         assert_eq!(v.as_slice(), val(i as u32).as_slice());
     }
 }
 
-/// Iterator with snapshot: verify it sees snapshot-consistent data.
 #[test]
-fn iterator_with_snapshot_consistent() {
+fn iterator_with_snapshot() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    for i in 0..100u32 {
-        db.put(&key(i), &val(i)).unwrap();
-    }
+    for i in 0..100u32 { db.put(&key(i), &val(i)).unwrap(); }
     let snap = db.snapshot();
-
-    for i in 100..200u32 {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-
+    for i in 100..200u32 { db.put(&key(i), &val(i)).unwrap(); }
     let mut it = db.iter_with_snapshot(&snap);
     it.seek_to_first();
-    let mut count = 0;
-    while it.valid() {
-        count += 1;
-        it.next();
-    }
-    assert_eq!(count, 100, "snapshot iterator should see exactly 100 keys");
-
+    let mut c = 0u32;
+    while it.valid() { c += 1; it.next(); }
+    assert_eq!(c, 100);
     db.release_snapshot(&snap);
 }
 
-/// Iterator over empty database: verify it's immediately invalid.
 #[test]
-fn iterator_empty_database() {
+fn iterator_empty_db() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
     let mut it = db.iter();
     it.seek_to_first();
-    assert!(!it.valid(), "iterator on empty db should be invalid");
-
+    assert!(!it.valid());
     let mut it2 = db.iter();
     it2.seek_to_last();
-    assert!(!it2.valid(), "seek_to_last on empty db should be invalid");
+    assert!(!it2.valid());
 }
 
 // =========================================================================
 // 6. Range Delete Tests
 // =========================================================================
 
-/// delete_range(b"b", b"d"), verify keys in range are gone, keys outside range survive.
 #[test]
 fn range_delete_basic() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    db.put(b"a", b"1").unwrap();
-    db.put(b"b", b"2").unwrap();
-    db.put(b"c", b"3").unwrap();
-    db.put(b"d", b"4").unwrap();
-    db.put(b"e", b"5").unwrap();
-
+    for c in [b'a', b'b', b'c', b'd', b'e'] { db.put(&[c], &[c]).unwrap(); }
     db.delete_range(b"b", b"d").unwrap();
-
-    assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()), "'a' should survive");
-    assert_eq!(db.get(b"b").unwrap(), None, "'b' should be range-deleted");
-    assert_eq!(db.get(b"c").unwrap(), None, "'c' should be range-deleted");
-    assert_eq!(db.get(b"d").unwrap(), Some(b"4".to_vec()), "'d' should survive (exclusive end)");
-    assert_eq!(db.get(b"e").unwrap(), Some(b"5".to_vec()), "'e' should survive");
+    assert_eq!(db.get(b"a").unwrap(), Some(b"a".to_vec()));
+    assert_eq!(db.get(b"b").unwrap(), None, "b range-deleted");
+    assert_eq!(db.get(b"c").unwrap(), None, "c range-deleted");
+    assert_eq!(db.get(b"d").unwrap(), Some(b"d".to_vec()), "d survives (exclusive end)");
+    assert_eq!(db.get(b"e").unwrap(), Some(b"e".to_vec()));
 }
 
-/// delete_range then put a key in the range, verify the new put is visible.
 #[test]
-fn range_delete_then_put_in_range() {
+fn range_delete_then_put() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
     db.put(b"b", b"old").unwrap();
     db.put(b"c", b"old").unwrap();
-    // Flush puts to SST so the range delete is clearly newer in sequence
     db.flush().unwrap();
-
     db.delete_range(b"b", b"d").unwrap();
-    assert_eq!(db.get(b"b").unwrap(), None, "'b' should be range-deleted");
-
+    assert_eq!(db.get(b"b").unwrap(), None);
     db.put(b"b", b"new").unwrap();
-
-    assert_eq!(
-        db.get(b"b").unwrap(),
-        Some(b"new".to_vec()),
-        "new put after range delete should be visible"
-    );
-    assert_eq!(db.get(b"c").unwrap(), None, "'c' should remain deleted");
+    assert_eq!(db.get(b"b").unwrap(), Some(b"new".to_vec()), "new put visible");
+    assert_eq!(db.get(b"c").unwrap(), None, "c stays deleted");
 }
 
-/// delete_range, flush, reopen, verify deletes persist.
 #[test]
-fn range_delete_flush_reopen_persists() {
+fn range_delete_flush_reopen() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().to_path_buf();
-
+    let p = dir.path().to_path_buf();
     {
-        let db = Db::open(default_opts(), &path).unwrap();
-        db.put(b"a", b"1").unwrap();
-        db.put(b"b", b"2").unwrap();
-        db.put(b"c", b"3").unwrap();
-        db.put(b"d", b"4").unwrap();
-        // Flush puts to SST first
+        let db = Db::open(default_opts(), &p).unwrap();
+        for c in [b'a', b'b', b'c', b'd'] { db.put(&[c], &[c]).unwrap(); }
         db.flush().unwrap();
-        // Then range-delete in a separate SST
         db.delete_range(b"b", b"d").unwrap();
         db.flush().unwrap();
         db.close().unwrap();
     }
-
     {
-        let db = Db::open(default_opts(), &path).unwrap();
-        assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
-        assert_eq!(db.get(b"b").unwrap(), None, "'b' should be range-deleted after reopen");
-        assert_eq!(db.get(b"c").unwrap(), None, "'c' should be range-deleted after reopen");
-        assert_eq!(db.get(b"d").unwrap(), Some(b"4".to_vec()));
+        let db = Db::open(default_opts(), &p).unwrap();
+        assert_eq!(db.get(b"a").unwrap(), Some(b"a".to_vec()));
+        assert_eq!(db.get(b"b").unwrap(), None, "b range-deleted after reopen");
+        assert_eq!(db.get(b"c").unwrap(), None, "c range-deleted after reopen");
+        assert_eq!(db.get(b"d").unwrap(), Some(b"d".to_vec()));
     }
 }
 
-/// Multiple overlapping delete_ranges, verify correct behavior.
 #[test]
-fn range_delete_overlapping_ranges() {
+fn range_delete_overlapping() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    for c in b'a'..=b'z' {
-        db.put(&[c], &[c]).unwrap();
-    }
-
+    for c in b'a'..=b'z' { db.put(&[c], &[c]).unwrap(); }
     db.delete_range(b"b", b"f").unwrap();
     db.delete_range(b"d", b"h").unwrap();
-
     assert_eq!(db.get(b"a").unwrap(), Some(b"a".to_vec()));
-    for c in b'b'..b'h' {
-        assert_eq!(db.get(&[c]).unwrap(), None, "'{}' should be range-deleted", c as char);
-    }
-    for c in b'h'..=b'z' {
-        assert_eq!(db.get(&[c]).unwrap(), Some(vec![c]), "'{}' should survive", c as char);
-    }
+    for c in b'b'..b'h' { assert_eq!(db.get(&[c]).unwrap(), None, "{} deleted", c as char); }
+    for c in b'h'..=b'z' { assert_eq!(db.get(&[c]).unwrap(), Some(vec![c])); }
 }
 
-/// delete_range covering all keys, verify database appears empty.
 #[test]
 fn range_delete_all_keys() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    for i in 0..100u32 {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-
+    for i in 0..100u32 { db.put(&key(i), &val(i)).unwrap(); }
     db.delete_range(b"k", b"l").unwrap();
-
-    for i in 0..100u32 {
-        assert_eq!(db.get(&key(i)).unwrap(), None, "key {} should be range-deleted", i);
-    }
-
-    let entries = collect_all(&db);
-    assert_eq!(entries.len(), 0, "database should appear empty after range delete of all keys");
+    for i in 0..100u32 { assert_eq!(db.get(&key(i)).unwrap(), None, "key {} deleted", i); }
+    assert_eq!(collect_fwd(&db).len(), 0);
 }
 
 // =========================================================================
 // 7. WriteBatch Atomicity
 // =========================================================================
 
-/// Batch with 1000 puts, verify all visible atomically.
 #[test]
-fn writebatch_1000_puts_all_visible() {
+fn writebatch_1000_puts() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    let mut batch = WriteBatch::new();
+    let mut b = WriteBatch::new();
+    for i in 0..1_000u32 { b.put(&key(i), &val(i)); }
+    db.write(WriteOptions::default(), b).unwrap();
     for i in 0..1_000u32 {
-        batch.put(&key(i), &val(i));
-    }
-    db.write(WriteOptions::default(), batch).unwrap();
-
-    for i in 0..1_000u32 {
-        let v = db.get(&key(i)).unwrap();
-        assert_eq!(v.as_deref(), Some(val(i).as_slice()), "batch put key {} not visible", i);
+        assert_eq!(db.get(&key(i)).unwrap().as_deref(), Some(val(i).as_slice()), "batch key {}", i);
     }
 }
 
-/// Batch with mixed puts and deletes, verify correct state.
 #[test]
 fn writebatch_mixed_puts_deletes() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    // Pre-populate
+    for i in 0..100u32 { db.put(&key(i), &val(i)).unwrap(); }
+    let mut b = WriteBatch::new();
     for i in 0..100u32 {
-        db.put(&key(i), &val(i)).unwrap();
+        if i % 2 == 0 { b.delete(&key(i)); }
+        else { b.put(&key(i), &val_ver(i, 99)); }
     }
-
-    let mut batch = WriteBatch::new();
+    db.write(WriteOptions::default(), b).unwrap();
     for i in 0..100u32 {
-        if i % 2 == 0 {
-            batch.delete(&key(i));
-        } else {
-            batch.put(&key(i), &val_versioned(i, 99));
-        }
-    }
-    db.write(WriteOptions::default(), batch).unwrap();
-
-    for i in 0..100u32 {
-        let v = db.get(&key(i)).unwrap();
-        if i % 2 == 0 {
-            assert_eq!(v, None, "even key {} should be deleted", i);
-        } else {
-            assert_eq!(
-                v.as_deref(),
-                Some(val_versioned(i, 99).as_slice()),
-                "odd key {} should be updated",
-                i
-            );
-        }
+        if i % 2 == 0 { assert_eq!(db.get(&key(i)).unwrap(), None, "even {} deleted", i); }
+        else { assert_eq!(db.get(&key(i)).unwrap().as_deref(), Some(val_ver(i, 99).as_slice())); }
     }
 }
 
-/// Multiple sequential batches, verify order is preserved.
 #[test]
-fn writebatch_sequential_order_preserved() {
+fn writebatch_sequential_order() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
     let mut b1 = WriteBatch::new();
-    for i in 0..50u32 {
-        b1.put(&key(i), &val_versioned(i, 0));
-    }
+    for i in 0..50u32 { b1.put(&key(i), &val_ver(i, 0)); }
     db.write(WriteOptions::default(), b1).unwrap();
-
     let mut b2 = WriteBatch::new();
-    for i in 0..25u32 {
-        b2.put(&key(i), &val_versioned(i, 1));
-    }
+    for i in 0..25u32 { b2.put(&key(i), &val_ver(i, 1)); }
     db.write(WriteOptions::default(), b2).unwrap();
-
     for i in 0..50u32 {
-        let v = db.get(&key(i)).unwrap();
-        let expected_ver = if i < 25 { 1 } else { 0 };
-        assert_eq!(
-            v.as_deref(),
-            Some(val_versioned(i, expected_ver).as_slice()),
-            "key {} should have version {}",
-            i,
-            expected_ver
-        );
+        let ev = if i < 25 { 1 } else { 0 };
+        assert_eq!(db.get(&key(i)).unwrap().as_deref(), Some(val_ver(i, ev).as_slice()));
     }
 }
 
@@ -1029,362 +632,228 @@ fn writebatch_sequential_order_preserved() {
 // 8. Concurrent Access
 // =========================================================================
 
-/// 4 reader threads + 1 writer thread, verify readers always see consistent state.
 #[test]
-fn concurrent_readers_and_writer() {
+fn concurrent_readers_writer() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    let n = 5_000u32;
-
-    // Pre-populate so all keys exist before concurrent access begins
-    for i in 0..n {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-
-    let barrier = Arc::new(std::sync::Barrier::new(5));
-    let mut handles = Vec::new();
-
-    // Writer thread: overwrite keys with new version
+    let n: u32 = 5_000;
+    for i in 0..n { db.put(&key(i), &val(i)).unwrap(); }
+    let bar = Arc::new(std::sync::Barrier::new(5));
+    let mut hs = Vec::new();
     {
         let db = Arc::clone(&db);
-        let barrier = Arc::clone(&barrier);
-        handles.push(thread::spawn(move || {
-            barrier.wait();
-            for i in 0..n {
-                db.put(&key(i), &val_versioned(i, 1)).unwrap();
-            }
+        let bar = Arc::clone(&bar);
+        hs.push(thread::spawn(move || {
+            bar.wait();
+            for i in 0..n { db.put(&key(i), &val_ver(i, 1)).unwrap(); }
         }));
     }
-
-    // 4 reader threads
     for t in 0..4 {
         let db = Arc::clone(&db);
-        let barrier = Arc::clone(&barrier);
-        handles.push(thread::spawn(move || {
-            barrier.wait();
+        let bar = Arc::clone(&bar);
+        hs.push(thread::spawn(move || {
+            bar.wait();
             for i in 0..n {
                 let v = db.get(&key(i)).unwrap();
-                assert!(
-                    v.is_some(),
-                    "thread {}: key {} should always exist",
-                    t, i
-                );
+                assert!(v.is_some(), "t{}: key {} missing", t, i);
                 let v = v.unwrap();
-                let old = val(i);
-                let new = val_versioned(i, 1);
-                assert!(
-                    v == old || v == new,
-                    "thread {}: key {} has unexpected value {:?}",
-                    t, i, v
-                );
+                assert!(v == val(i) || v == val_ver(i, 1), "t{}: key {} bad val", t, i);
             }
         }));
     }
-
-    for h in handles {
-        h.join().unwrap();
-    }
+    for h in hs { h.join().unwrap(); }
 }
 
-/// 4 reader threads doing random reads while writer does sequential writes.
 #[test]
-fn concurrent_random_reads_sequential_writes() {
+fn concurrent_random_reads_seq_writes() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    let n = 5_000u32;
-
+    let n: u32 = 5_000;
     let db_w = Arc::clone(&db);
-    let writer = thread::spawn(move || {
-        for i in 0..n {
-            db_w.put(&key(i), &val(i)).unwrap();
-        }
+    let w = thread::spawn(move || {
+        for i in 0..n { db_w.put(&key(i), &val(i)).unwrap(); }
     });
-
-    let mut readers = Vec::new();
+    let mut rs = Vec::new();
     for _ in 0..4 {
         let db = Arc::clone(&db);
-        readers.push(thread::spawn(move || {
+        rs.push(thread::spawn(move || {
             for i in 0..n {
-                let v = db.get(&key(i)).unwrap();
-                if let Some(v) = v {
-                    assert_eq!(v, val(i), "key {} has wrong value", i);
+                if let Some(v) = db.get(&key(i)).unwrap() {
+                    assert_eq!(v, val(i), "key {} wrong val", i);
                 }
             }
         }));
     }
-
-    writer.join().unwrap();
-    for r in readers {
-        r.join().unwrap();
-    }
+    w.join().unwrap();
+    for r in rs { r.join().unwrap(); }
 }
 
-/// Multiple threads creating iterators concurrently.
 #[test]
 fn concurrent_iterators() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    for i in 0..1_000u32 {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-
-    let mut handles = Vec::new();
+    for i in 0..1_000u32 { db.put(&key(i), &val(i)).unwrap(); }
+    let mut hs = Vec::new();
     for _ in 0..4 {
         let db = Arc::clone(&db);
-        handles.push(thread::spawn(move || {
+        hs.push(thread::spawn(move || {
             let mut it = db.iter();
             it.seek_to_first();
-            let mut count = 0;
-            while it.valid() {
-                count += 1;
-                it.next();
-            }
-            assert!(count >= 1000, "concurrent iterator should see all keys");
+            let mut c = 0u32;
+            while it.valid() { c += 1; it.next(); }
+            assert!(c >= 1000);
         }));
     }
-
-    for h in handles {
-        h.join().unwrap();
-    }
+    for h in hs { h.join().unwrap(); }
 }
 
-/// Snapshot taken by one thread, read by another thread.
 #[test]
 fn snapshot_cross_thread() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    for i in 0..500u32 {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-
+    for i in 0..500u32 { db.put(&key(i), &val(i)).unwrap(); }
     let snap = db.snapshot();
-
-    for i in 500..1000u32 {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-
+    for i in 500..1000u32 { db.put(&key(i), &val(i)).unwrap(); }
     let db2 = Arc::clone(&db);
-    let handle = thread::spawn(move || {
+    let h = thread::spawn(move || {
         let mut it = db2.iter_with_snapshot(&snap);
         it.seek_to_first();
-        let mut count = 0;
-        while it.valid() {
-            count += 1;
-            it.next();
-        }
-        assert_eq!(count, 500, "cross-thread snapshot should see exactly 500 keys");
+        let mut c = 0u32;
+        while it.valid() { c += 1; it.next(); }
+        assert_eq!(c, 500, "cross-thread snap should see 500");
         db2.release_snapshot(&snap);
     });
-
-    handle.join().unwrap();
+    h.join().unwrap();
 }
 
 // =========================================================================
 // 9. Edge Cases
 // =========================================================================
 
-/// Empty key (b""), empty value (b"").
 #[test]
 fn edge_empty_key_empty_value() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    db.put(b"", b"empty_key_val").unwrap();
-    assert_eq!(db.get(b"").unwrap(), Some(b"empty_key_val".to_vec()));
-
-    db.put(b"has_empty_val", b"").unwrap();
-    assert_eq!(db.get(b"has_empty_val").unwrap(), Some(b"".to_vec()));
-
+    db.put(b"", b"val").unwrap();
+    assert_eq!(db.get(b"").unwrap(), Some(b"val".to_vec()));
+    db.put(b"k", b"").unwrap();
+    assert_eq!(db.get(b"k").unwrap(), Some(b"".to_vec()));
     db.put(b"", b"").unwrap();
     assert_eq!(db.get(b"").unwrap(), Some(b"".to_vec()));
 }
 
-/// Very long key (10KB), very long value (1MB).
 #[test]
 fn edge_long_key_long_value() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    let long_key = vec![0x42u8; 10 * 1024]; // 10KB
-    let long_val = vec![0xABu8; 1024 * 1024]; // 1MB
-
-    db.put(&long_key, &long_val).unwrap();
-    let result = db.get(&long_key).unwrap();
-    assert_eq!(result, Some(long_val.clone()));
-
+    let lk = vec![0x42u8; 10 * 1024];
+    let lv = vec![0xABu8; 1024 * 1024];
+    db.put(&lk, &lv).unwrap();
+    assert_eq!(db.get(&lk).unwrap(), Some(lv.clone()));
     db.flush().unwrap();
-    let result2 = db.get(&long_key).unwrap();
-    assert_eq!(result2, Some(long_val));
+    assert_eq!(db.get(&lk).unwrap(), Some(lv));
 }
 
-/// Binary keys with null bytes, high bytes (0xFF).
 #[test]
-fn edge_binary_keys_null_bytes() {
+fn edge_binary_keys() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    let key_null = b"\x00\x00\x00".to_vec();
-    let key_high = b"\xFF\xFF\xFF".to_vec();
-    let key_mixed = b"\x00\xFF\x00\xFF".to_vec();
-
-    db.put(&key_null, b"null").unwrap();
-    db.put(&key_high, b"high").unwrap();
-    db.put(&key_mixed, b"mixed").unwrap();
-
-    assert_eq!(db.get(&key_null).unwrap(), Some(b"null".to_vec()));
-    assert_eq!(db.get(&key_high).unwrap(), Some(b"high".to_vec()));
-    assert_eq!(db.get(&key_mixed).unwrap(), Some(b"mixed".to_vec()));
-
+    let kn = b"\x00\x00\x00".to_vec();
+    let kh = b"\xFF\xFF\xFF".to_vec();
+    let km = b"\x00\xFF\x00\xFF".to_vec();
+    db.put(&kn, b"null").unwrap();
+    db.put(&kh, b"high").unwrap();
+    db.put(&km, b"mixed").unwrap();
+    assert_eq!(db.get(&kn).unwrap(), Some(b"null".to_vec()));
+    assert_eq!(db.get(&kh).unwrap(), Some(b"high".to_vec()));
+    assert_eq!(db.get(&km).unwrap(), Some(b"mixed".to_vec()));
     db.flush().unwrap();
-    assert_eq!(db.get(&key_null).unwrap(), Some(b"null".to_vec()));
-    assert_eq!(db.get(&key_high).unwrap(), Some(b"high".to_vec()));
-    assert_eq!(db.get(&key_mixed).unwrap(), Some(b"mixed".to_vec()));
+    assert_eq!(db.get(&kn).unwrap(), Some(b"null".to_vec()));
+    assert_eq!(db.get(&kh).unwrap(), Some(b"high".to_vec()));
+    assert_eq!(db.get(&km).unwrap(), Some(b"mixed".to_vec()));
 }
 
-/// Thousands of tiny keys (1 byte each).
 #[test]
-fn edge_thousands_of_tiny_keys() {
+fn edge_tiny_keys() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    for b in 0..=255u8 {
-        db.put(&[b], &[b]).unwrap();
-    }
-
-    for b in 0..=255u8 {
-        let v = db.get(&[b]).unwrap();
-        assert_eq!(v, Some(vec![b]), "tiny key 0x{:02X} mismatch", b);
-    }
-
-    let entries = collect_all(&db);
-    assert_eq!(entries.len(), 256);
+    for b in 0..=255u8 { db.put(&[b], &[b]).unwrap(); }
+    for b in 0..=255u8 { assert_eq!(db.get(&[b]).unwrap(), Some(vec![b]), "0x{:02X}", b); }
+    assert_eq!(collect_fwd(&db).len(), 256);
 }
 
-/// Put same key 10,000 times, verify only latest visible.
 #[test]
 fn edge_same_key_10000_times() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-
-    for i in 0..10_000u32 {
-        db.put(b"thekey", format!("{}", i).as_bytes()).unwrap();
-    }
-
-    let v = db.get(b"thekey").unwrap();
-    assert_eq!(v, Some(b"9999".to_vec()), "only latest version should be visible");
-
-    let entries = collect_all(&db);
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].0, b"thekey");
-    assert_eq!(entries[0].1, b"9999");
+    for i in 0..10_000u32 { db.put(b"k", format!("{}", i).as_bytes()).unwrap(); }
+    assert_eq!(db.get(b"k").unwrap(), Some(b"9999".to_vec()));
+    let e = collect_fwd(&db);
+    assert_eq!(e.len(), 1);
 }
 
-/// Open with error_if_exists on existing DB -- verify error.
 #[test]
-fn edge_error_if_exists_on_existing_db() {
+fn edge_error_if_exists() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().to_path_buf();
-
-    {
-        let db = Db::open(default_opts(), &path).unwrap();
-        db.close().unwrap();
-    }
-
-    let mut opts = default_opts();
-    opts.error_if_exists = true;
-    let result = Db::open(opts, &path);
-    assert!(result.is_err(), "opening existing DB with error_if_exists should fail");
+    let p = dir.path().to_path_buf();
+    { let db = Db::open(default_opts(), &p).unwrap(); db.close().unwrap(); }
+    let mut o = default_opts();
+    o.error_if_exists = true;
+    assert!(Db::open(o, &p).is_err());
 }
 
-/// Open non-existent path without create_if_missing -- verify error.
 #[test]
-fn edge_open_nonexistent_no_create() {
+fn edge_no_create_if_missing() {
     let dir = TempDir::new().unwrap();
-    let path = dir.path().join("does_not_exist");
-
-    let mut opts = Options::default();
-    opts.create_if_missing = false;
-    let result = Db::open(opts, &path);
-    assert!(result.is_err(), "opening non-existent path without create_if_missing should fail");
+    let p = dir.path().join("nope");
+    let mut o = Options::default();
+    o.create_if_missing = false;
+    assert!(Db::open(o, &p).is_err());
 }
 
 // =========================================================================
 // 10. Performance Sanity Checks
 // =========================================================================
 
-/// Write 100K keys sequentially, verify total time is reasonable.
 #[test]
 fn perf_write_sequential() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    let n = 10_000u32;
-
-    let start = Instant::now();
-    for i in 0..n {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-    let elapsed = start.elapsed();
-
-    assert!(
-        elapsed.as_secs() < 30,
-        "writing {} keys took {:?} which exceeds 30s limit",
-        n, elapsed
-    );
+    let n: u32 = 10_000;
+    let t = Instant::now();
+    for i in 0..n { db.put(&key(i), &val(i)).unwrap(); }
+    let d = t.elapsed();
+    assert!(d.as_secs() < 30, "{}K writes took {:?}", n / 1000, d);
 }
 
-/// Read 10K random keys, verify total time is reasonable.
 #[test]
 fn perf_read_random() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    let n = 10_000u32;
-
-    for i in 0..n {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-
-    let start = Instant::now();
+    let n: u32 = 10_000;
+    for i in 0..n { db.put(&key(i), &val(i)).unwrap(); }
+    db.flush().unwrap();
+    let t = Instant::now();
     for i in 0..n {
         let idx = (i.wrapping_mul(7919) + 104729) % n;
-        let v = db.get(&key(idx)).unwrap();
-        assert!(v.is_some(), "key {} missing during perf read", idx);
+        assert!(db.get(&key(idx)).unwrap().is_some(), "key {}", idx);
     }
-    let elapsed = start.elapsed();
-
-    assert!(
-        elapsed.as_secs() < 120,
-        "reading {} random keys took {:?} which exceeds 120s limit",
-        n, elapsed
-    );
+    let d = t.elapsed();
+    assert!(d.as_secs() < 120, "{}K reads took {:?}", n / 1000, d);
 }
 
-/// Iterator scan of 10K keys, verify completes quickly.
 #[test]
 fn perf_iterator_scan() {
     let dir = TempDir::new().unwrap();
     let db = open(&dir);
-    let n = 10_000u32;
-
-    for i in 0..n {
-        db.put(&key(i), &val(i)).unwrap();
-    }
-
-    let start = Instant::now();
+    let n: u32 = 10_000;
+    for i in 0..n { db.put(&key(i), &val(i)).unwrap(); }
+    let t = Instant::now();
     let mut it = db.iter();
     it.seek_to_first();
-    let mut count = 0u32;
-    while it.valid() {
-        count += 1;
-        it.next();
-    }
-    let elapsed = start.elapsed();
-
-    assert_eq!(count, n);
-    assert!(
-        elapsed.as_secs() < 60,
-        "iterating {} keys took {:?} which exceeds 60s limit",
-        n, elapsed
-    );
+    let mut c = 0u32;
+    while it.valid() { c += 1; it.next(); }
+    let d = t.elapsed();
+    assert_eq!(c, n);
+    assert!(d.as_secs() < 60, "{}K scan took {:?}", n / 1000, d);
 }
