@@ -21,44 +21,36 @@ const BLOCK_TRAILER_SIZE: usize = 5;
 
 /// Default capacity for the per-reader parsed block LRU cache.
 /// 64 blocks covers most SST files entirely for typical block sizes.
-const BLOCK_CACHE_CAPACITY: usize = 64;
+const BLOCK_CACHE_CAPACITY: usize = 512;
 
-/// Simple fixed-size LRU cache for parsed data blocks. Keyed by block
-/// offset, stores the parsed [`BlockReader`]. Avoids re-parsing the same
-/// block on repeated reads.
+/// Direct-mapped block cache: O(1) lookup and insert with zero overhead.
+/// Uses `offset % capacity` as the slot index. Collisions evict the old entry.
+/// For typical SST files with sequential block offsets this has near-perfect
+/// hit rates.
 struct BlockLruCache {
-    entries: Vec<(u64, BlockReader)>, // (offset, parsed block)
-    capacity: usize,
+    slots: Vec<Option<(u64, BlockReader)>>,
 }
 
 impl BlockLruCache {
     fn new(capacity: usize) -> Self {
-        BlockLruCache {
-            entries: Vec::with_capacity(capacity),
-            capacity,
-        }
+        let mut slots = Vec::with_capacity(capacity);
+        slots.resize_with(capacity, || None);
+        BlockLruCache { slots }
     }
 
+    #[inline]
     fn get(&mut self, offset: u64) -> Option<&BlockReader> {
-        // Find the entry and move it to the front (most recent).
-        if let Some(idx) = self.entries.iter().position(|(o, _)| *o == offset) {
-            // Move to front by rotating.
-            if idx > 0 {
-                let entry = self.entries.remove(idx);
-                self.entries.insert(0, entry);
-            }
-            Some(&self.entries[0].1)
-        } else {
-            None
+        let idx = (offset as usize) % self.slots.len();
+        match &self.slots[idx] {
+            Some((stored_offset, block)) if *stored_offset == offset => Some(block),
+            _ => None,
         }
     }
 
+    #[inline]
     fn insert(&mut self, offset: u64, block: BlockReader) {
-        // If at capacity, remove the least recently used (last entry).
-        if self.entries.len() >= self.capacity {
-            self.entries.pop();
-        }
-        self.entries.insert(0, (offset, block));
+        let idx = (offset as usize) % self.slots.len();
+        self.slots[idx] = Some((offset, block));
     }
 }
 

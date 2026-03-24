@@ -868,16 +868,8 @@ impl Db {
             file_meta.file_size,
         )?;
 
-        // Fast reject via bloom filter (checked inside get_for_user_key,
-        // but we check here first to record the stat).
-        if !reader.bloom_may_contain(user_key) {
-            Statistics::record(&self.stats.bloom_useful, 1);
-            return Ok(SearchResult::NotFound);
-        }
-
         match reader.get_for_user_key(user_key, sequence)? {
             Some(crate::sst::UserKeyResult::Found(value, value_seq)) => {
-                Statistics::record(&self.stats.bytes_read, value.len() as u64);
                 Ok(SearchResult::Found(value, value_seq))
             }
             Some(crate::sst::UserKeyResult::Deleted) => Ok(SearchResult::Deleted),
