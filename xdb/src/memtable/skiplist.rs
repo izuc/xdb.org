@@ -12,6 +12,7 @@ use crate::types::{
 };
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Maximum height a skiplist node may reach.
 const MAX_HEIGHT: usize = 12;
@@ -24,28 +25,25 @@ const BRANCHING_FACTOR: u32 = 4;
 // ---------------------------------------------------------------------------
 
 /// A single node in the skiplist.
+///
+/// Uses a fixed-size array for forward pointers instead of `Vec` to
+/// eliminate one heap allocation per insert. The 96 bytes of unused
+/// pointer slots (for nodes shorter than MAX_HEIGHT) is negligible
+/// compared to the allocation overhead saved on the hot write path.
 struct Node {
     key: Vec<u8>,
     value: Vec<u8>,
-    /// Height of this node (number of levels it participates in).
-    #[allow(dead_code)]
     height: usize,
-    /// Forward pointers, one per level. Length == `height`.
-    next: Vec<AtomicPtr<Node>>,
+    next: [AtomicPtr<Node>; MAX_HEIGHT],
 }
 
 impl Node {
-    /// Allocate a new node with the given key, value, and height.
     fn new(key: Vec<u8>, value: Vec<u8>, height: usize) -> *mut Node {
-        let mut next = Vec::with_capacity(height);
-        for _ in 0..height {
-            next.push(AtomicPtr::new(ptr::null_mut()));
-        }
         let node = Box::new(Node {
             key,
             value,
             height,
-            next,
+            next: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
         });
         Box::into_raw(node)
     }
@@ -53,13 +51,13 @@ impl Node {
     /// Read the next pointer at the given level with Acquire ordering.
     #[inline]
     unsafe fn get_next(node: *const Node, level: usize) -> *mut Node {
-        (&(*node).next)[level].load(Ordering::Acquire)
+        (*node).next[level].load(Ordering::Acquire)
     }
 
     /// Set the next pointer at the given level with Release ordering.
     #[inline]
     unsafe fn set_next(node: *mut Node, level: usize, next: *mut Node) {
-        (&(*node).next)[level].store(next, Ordering::Release);
+        (*node).next[level].store(next, Ordering::Release);
     }
 }
 
@@ -317,7 +315,7 @@ impl MemTable {
         if node_seq > lookup_seq {
             // The entry is newer than our snapshot. Walk forward to find an
             // older version, or determine the key doesn't exist at this snapshot.
-            let mut cur = unsafe { (&(*node).next)[0].load(Ordering::Acquire) };
+            let mut cur = unsafe { (*node).next[0].load(Ordering::Acquire) };
             while !cur.is_null() {
                 let cur_key = unsafe { &(*cur).key };
                 let cur_user = extract_user_key(cur_key);
@@ -340,7 +338,7 @@ impl MemTable {
                         None => None,
                     };
                 }
-                cur = unsafe { (&(*cur).next)[0].load(Ordering::Acquire) };
+                cur = unsafe { (*cur).next[0].load(Ordering::Acquire) };
             }
             return None;
         }
@@ -448,6 +446,116 @@ impl<'a> MemTableIterator<'a> {
 // SAFETY: the iterator only holds a shared reference to the skiplist and a raw
 // pointer that is only dereferenced while the borrow is live.
 unsafe impl Send for MemTableIterator<'_> {}
+
+// ---------------------------------------------------------------------------
+// OwnedMemTableIterator — holds Arc<MemTable> for use in Box<dyn XdbIterator>
+// ---------------------------------------------------------------------------
+
+/// An owning iterator over a [`MemTable`] that keeps it alive via `Arc`.
+///
+/// Unlike [`MemTableIterator`] which borrows the memtable (and thus can't be
+/// stored in a `Box<dyn XdbIterator + 'static>`), this variant holds an
+/// `Arc<MemTable>`. This eliminates the need to copy the entire memtable
+/// into a `Vec` when constructing database-level iterators.
+pub struct OwnedMemTableIterator {
+    _mem: Arc<MemTable>,
+    head: *mut Node,
+    current: *mut Node,
+}
+
+// SAFETY: The Arc<MemTable> ensures the SkipList (and all its nodes) stays
+// alive for the lifetime of this iterator. The raw pointer `current` always
+// points to a valid node within the SkipList or is null.
+unsafe impl Send for OwnedMemTableIterator {}
+
+impl OwnedMemTableIterator {
+    /// Create a new owning iterator. The Arc keeps the memtable alive.
+    pub fn new(mem: Arc<MemTable>) -> Self {
+        let head = mem.list.head;
+        OwnedMemTableIterator {
+            _mem: mem,
+            head,
+            current: ptr::null_mut(),
+        }
+    }
+}
+
+impl crate::iterator::XdbIterator for OwnedMemTableIterator {
+    fn valid(&self) -> bool {
+        !self.current.is_null()
+    }
+
+    fn seek_to_first(&mut self) {
+        self.current = unsafe { Node::get_next(self.head, 0) };
+    }
+
+    fn seek(&mut self, target: &[u8]) {
+        // Walk the skiplist from head to find the first node >= target.
+        let mut current = self.head;
+        let mut level = unsafe { (*self.head).height } - 1;
+        loop {
+            let next = unsafe { Node::get_next(current, level) };
+            if !next.is_null()
+                && compare_internal_key(unsafe { &(*next).key }, target)
+                    == std::cmp::Ordering::Less
+            {
+                current = next;
+            } else {
+                if level == 0 {
+                    self.current = next;
+                    return;
+                }
+                level -= 1;
+            }
+        }
+    }
+
+    fn next(&mut self) {
+        if self.valid() {
+            self.current = unsafe { Node::get_next(self.current, 0) };
+        }
+    }
+
+    fn key(&self) -> &[u8] {
+        unsafe { &(*self.current).key }
+    }
+
+    fn value(&self) -> &[u8] {
+        unsafe { &(*self.current).value }
+    }
+
+    fn seek_to_last(&mut self) {
+        // Walk level 0 to find the last node.
+        let mut node = unsafe { Node::get_next(self.head, 0) };
+        if node.is_null() {
+            self.current = ptr::null_mut();
+            return;
+        }
+        loop {
+            let next = unsafe { Node::get_next(node, 0) };
+            if next.is_null() {
+                self.current = node;
+                return;
+            }
+            node = next;
+        }
+    }
+
+    fn prev(&mut self) {
+        if !self.valid() {
+            return;
+        }
+        // Walk level 0 from head to find the node before current.
+        let target = self.current;
+        let mut prev_node = ptr::null_mut();
+        let mut node = unsafe { Node::get_next(self.head, 0) };
+        while !node.is_null() && node != target {
+            prev_node = node;
+            node = unsafe { Node::get_next(node, 0) };
+        }
+        self.current = prev_node; // null if current was the first node
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests

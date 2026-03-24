@@ -200,8 +200,9 @@ impl Db {
 
         // Spawn background thread for compaction and flush.
         let weak = Arc::downgrade(&db);
+        let thread_name = format!("xdb-bg-{}", db.dbname.display());
         let handle = thread::Builder::new()
-            .name("xdb-bg".to_string())
+            .name(thread_name)
             .spawn(move || Self::background_worker(weak, bg_receiver))
             .map_err(Error::Io)?;
         *db._bg_handle.lock() = Some(handle);
@@ -510,17 +511,15 @@ impl Db {
 
         let mut children: Vec<Box<dyn XdbIterator>> = Vec::new();
 
-        // Memtable entries.
-        let mem_entries = Self::collect_memtable_entries(&mem);
-        if !mem_entries.is_empty() {
-            children.push(Box::new(VecIterator::new(mem_entries)));
+        // Memtable iterators — use Arc-based owning iterators to avoid
+        // copying the entire memtable into a Vec. O(1) instead of O(N).
+        use crate::memtable::OwnedMemTableIterator;
+        if !mem.is_empty() {
+            children.push(Box::new(OwnedMemTableIterator::new(Arc::clone(&mem))));
         }
-
-        // Immutable memtable entries.
         if let Some(ref imm) = imm {
-            let imm_entries = Self::collect_memtable_entries(imm);
-            if !imm_entries.is_empty() {
-                children.push(Box::new(VecIterator::new(imm_entries)));
+            if !imm.is_empty() {
+                children.push(Box::new(OwnedMemTableIterator::new(Arc::clone(imm))));
             }
         }
 
@@ -642,17 +641,7 @@ impl Db {
         false
     }
 
-    /// Collect all entries from a memtable into a Vec for use in iterators.
-    fn collect_memtable_entries(mem: &MemTable) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut entries = Vec::new();
-        let mut iter = mem.iter();
-        iter.seek_to_first();
-        while iter.valid() {
-            entries.push((iter.key().to_vec(), iter.value().to_vec()));
-            iter.next();
-        }
-        entries
-    }
+
 
     fn make_room_for_write(&self, state: &mut DbState) -> Result<()> {
         if state.mem.approximate_memory_usage() < self.options.write_buffer_size {
@@ -1200,53 +1189,3 @@ impl<'a> WriteBatchHandler for MemTableInserter<'a> {
     }
 }
 
-/// Simple vector-based iterator for memtable snapshots.
-struct VecIterator {
-    entries: Vec<(Vec<u8>, Vec<u8>)>,
-    pos: usize,
-}
-
-impl VecIterator {
-    fn new(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
-        VecIterator { entries, pos: 0 }
-    }
-}
-
-impl XdbIterator for VecIterator {
-    fn valid(&self) -> bool {
-        self.pos < self.entries.len()
-    }
-    fn seek_to_first(&mut self) {
-        self.pos = 0;
-    }
-    fn seek(&mut self, target: &[u8]) {
-        self.pos = self.entries.partition_point(|(k, _)| {
-            compare_internal_key(k, target) == std::cmp::Ordering::Less
-        });
-    }
-    fn next(&mut self) {
-        if self.valid() {
-            self.pos += 1;
-        }
-    }
-    fn key(&self) -> &[u8] {
-        &self.entries[self.pos].0
-    }
-    fn value(&self) -> &[u8] {
-        &self.entries[self.pos].1
-    }
-    fn seek_to_last(&mut self) {
-        if self.entries.is_empty() {
-            self.pos = 0;
-        } else {
-            self.pos = self.entries.len() - 1;
-        }
-    }
-    fn prev(&mut self) {
-        if self.pos > 0 {
-            self.pos -= 1;
-        } else {
-            self.pos = self.entries.len(); // invalidate
-        }
-    }
-}
