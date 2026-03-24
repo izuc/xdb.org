@@ -165,6 +165,19 @@ enum BlockData {
     },
 }
 
+impl Clone for BlockData {
+    fn clone(&self) -> Self {
+        match self {
+            BlockData::Owned(v) => BlockData::Owned(v.clone()),
+            BlockData::Shared { data, start, end } => BlockData::Shared {
+                data: Arc::clone(data),
+                start: *start,
+                end: *end,
+            },
+        }
+    }
+}
+
 impl BlockData {
     #[inline]
     fn as_slice(&self) -> &[u8] {
@@ -185,6 +198,16 @@ pub struct BlockReader {
     num_restarts: u32,
 }
 
+impl Clone for BlockReader {
+    fn clone(&self) -> Self {
+        BlockReader {
+            data: self.data.clone(),
+            restarts_offset: self.restarts_offset,
+            num_restarts: self.num_restarts,
+        }
+    }
+}
+
 impl BlockReader {
     /// Parse a block from raw owned bytes (the bytes returned by
     /// [`BlockBuilder::finish`], without the 5-byte on-disk trailer).
@@ -199,6 +222,7 @@ impl BlockReader {
 
     /// Create a `BlockReader` that references a slice of a shared buffer
     /// without copying. The `Arc<Vec<u8>>` keeps the underlying data alive.
+    #[inline]
     pub fn from_shared(buf: Arc<Vec<u8>>, start: usize, end: usize) -> error::Result<Self> {
         assert!(
             start <= end && end <= buf.len(),

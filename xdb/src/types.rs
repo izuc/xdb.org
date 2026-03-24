@@ -129,6 +129,7 @@ pub struct ParsedInternalKey<'a> {
 
 impl<'a> ParsedInternalKey<'a> {
     /// Decode from a byte slice that contains `user_key ++ tag(8)`.
+    #[inline]
     pub fn from_bytes(data: &'a [u8]) -> Option<Self> {
         if data.len() < 8 {
             return None;

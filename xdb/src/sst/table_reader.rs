@@ -19,6 +19,49 @@ use crate::sst::footer::{BlockHandle, Footer, FOOTER_SIZE};
 /// Size of the block trailer on disk (compression_type: u8 + checksum: u32 LE).
 const BLOCK_TRAILER_SIZE: usize = 5;
 
+/// Default capacity for the per-reader parsed block LRU cache.
+/// 64 blocks covers most SST files entirely for typical block sizes.
+const BLOCK_CACHE_CAPACITY: usize = 64;
+
+/// Simple fixed-size LRU cache for parsed data blocks. Keyed by block
+/// offset, stores the parsed [`BlockReader`]. Avoids re-parsing the same
+/// block on repeated reads.
+struct BlockLruCache {
+    entries: Vec<(u64, BlockReader)>, // (offset, parsed block)
+    capacity: usize,
+}
+
+impl BlockLruCache {
+    fn new(capacity: usize) -> Self {
+        BlockLruCache {
+            entries: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn get(&mut self, offset: u64) -> Option<&BlockReader> {
+        // Find the entry and move it to the front (most recent).
+        if let Some(idx) = self.entries.iter().position(|(o, _)| *o == offset) {
+            // Move to front by rotating.
+            if idx > 0 {
+                let entry = self.entries.remove(idx);
+                self.entries.insert(0, entry);
+            }
+            Some(&self.entries[0].1)
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, offset: u64, block: BlockReader) {
+        // If at capacity, remove the least recently used (last entry).
+        if self.entries.len() >= self.capacity {
+            self.entries.pop();
+        }
+        self.entries.insert(0, (offset, block));
+    }
+}
+
 /// Result of a user-key lookup that accounts for sequence numbers and deletions.
 pub enum UserKeyResult {
     /// The key was found with this value and sequence number.
@@ -41,9 +84,10 @@ pub struct TableReader {
     /// Cached range tombstones: (start_user_key, end_user_key, sequence).
     /// Parsed once at open time so point lookups don't need to scan the file.
     range_tombstones: Vec<(Vec<u8>, Vec<u8>, u64)>,
-    /// Block offsets whose CRC32 has been verified. Subsequent reads to
-    /// the same block skip the ~100-150ns CRC computation.
-    verified_blocks: parking_lot::Mutex<std::collections::HashSet<u64>>,
+    /// Per-reader cache of recently parsed data blocks. Keyed by block
+    /// offset, stores the parsed BlockReader. Avoids re-parsing the same
+    /// block on repeated reads.
+    block_cache: parking_lot::Mutex<BlockLruCache>,
     #[allow(dead_code)]
     options: Options,
 }
@@ -101,7 +145,7 @@ impl TableReader {
             index_block,
             filter_data,
             range_tombstones,
-            verified_blocks: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            block_cache: parking_lot::Mutex::new(BlockLruCache::new(BLOCK_CACHE_CAPACITY)),
             options,
         })
     }
@@ -152,6 +196,7 @@ impl TableReader {
     ///
     /// Returns `true` if the key might be in this file (or no bloom filter
     /// exists). Returns `false` if the key is definitely absent.
+    #[inline]
     pub fn bloom_may_contain(&self, user_key: &[u8]) -> bool {
         match self.filter_data {
             Some(ref fd) => BloomFilter::may_contain(fd, user_key),
@@ -296,24 +341,15 @@ impl TableReader {
             )));
         }
 
-        // Fast path: if this block's CRC was already verified, skip the
-        // ~100-150ns CRC32 computation entirely.
-        let already_verified = self.verified_blocks.lock().contains(&handle.offset);
-
-        if already_verified {
-            let trailer = &self.data[offset + size..offset + total];
-            let compression_type = trailer[0];
-            if compression_type == compression::COMPRESSION_NONE {
-                return BlockReader::from_shared(
-                    Arc::clone(&self.data),
-                    offset,
-                    offset + size,
-                );
+        // Fastest path: return a cached, already-parsed BlockReader.
+        // Clone is cheap for Shared blocks (just Arc::clone, ~1ns).
+        // This single lock replaces both the old verified_blocks HashSet
+        // AND the block parse — one lock instead of two.
+        {
+            let mut cache = self.block_cache.lock();
+            if let Some(block) = cache.get(handle.offset) {
+                return Ok(block.clone());
             }
-            // Compressed block that was verified before — still need to decompress.
-            let block_data = &self.data[offset..offset + size];
-            let decompressed = compression::decompress(block_data, compression_type)?;
-            return BlockReader::new(decompressed);
         }
 
         // Slow path: verify CRC32 then cache the result.
@@ -335,16 +371,16 @@ impl TableReader {
             )));
         }
 
-        // Cache the verification so future reads skip CRC.
-        self.verified_blocks.lock().insert(handle.offset);
+        // Cache the parsed block (replaces the old verified_blocks set).
 
-        if compression_type == compression::COMPRESSION_NONE {
-            BlockReader::from_shared(Arc::clone(&self.data), offset, offset + size)
+        let block = if compression_type == compression::COMPRESSION_NONE {
+            BlockReader::from_shared(Arc::clone(&self.data), offset, offset + size)?
         } else {
-            // Compressed: must decompress into an owned buffer.
             let decompressed = compression::decompress(block_data, compression_type)?;
-            BlockReader::new(decompressed)
-        }
+            BlockReader::new(decompressed)?
+        };
+        self.block_cache.lock().insert(handle.offset, block.clone());
+        Ok(block)
     }
 
     /// Iterate over all key-value pairs in the table.

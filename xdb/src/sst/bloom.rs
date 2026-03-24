@@ -14,6 +14,7 @@ pub struct BloomFilter {
 }
 
 /// Simple hash function similar to LevelDB's bloom hash.
+#[inline]
 fn bloom_hash(key: &[u8]) -> u32 {
     let mut h: u32 = 0;
     for &b in key {
@@ -67,6 +68,7 @@ impl BloomFilter {
     ///
     /// Returns `false` if the key is **definitely not** present.
     /// Returns `true` if the key **might** be present (possible false positive).
+    #[inline]
     pub fn may_contain(filter_data: &[u8], key: &[u8]) -> bool {
         if filter_data.is_empty() {
             return false;
