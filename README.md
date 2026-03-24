@@ -90,9 +90,11 @@ filter, release mode, Windows 11 / x86-64):
 |----------|-----|---------|--------|
 | Sequential writes (1K keys) | 25.0 ms | 43.5 ms | **xdb 1.7x faster** |
 | Sequential writes (10K keys) | 34.4 ms | 189 ms | **xdb 5.5x faster** |
-| Random point reads (50K keys) | 719 ns/read | 1,120 ns/read | **xdb 1.56x faster** |
+| Random point reads (50K keys) | 686 ns/read | 1,265 ns/read | **xdb 1.84x faster** |
 
 Key optimizations that make xdb fast:
+- **CRC32 block cache** -- verified blocks skip the ~100ns CRC recomputation
+  on repeated reads
 - **Empty memtable fast-path** -- skips the 12-level skiplist descent when the
   memtable is empty (common after flush)
 - **Zero-copy block reads** -- uncompressed data blocks are borrowed directly
