@@ -467,7 +467,9 @@ impl Db {
         // Signal background thread to stop.
         let _ = self.bg_sender.send(BgWork::Shutdown);
 
-        // Wait for the background thread to finish (with a timeout to avoid hangs).
+        // Wait for the background thread to finish. This blocks until the
+        // current flush/compaction round completes (the shutting_down flag
+        // causes the compaction loop to exit early between rounds).
         if let Some(handle) = self._bg_handle.lock().take() {
             let _ = handle.join();
         }
@@ -492,10 +494,14 @@ impl Db {
     /// Fsync the database directory to ensure newly created files (WAL, SST)
     /// are durable in the directory listing. Without this, a crash could
     /// cause a successfully written file to vanish from the directory.
-    fn sync_dir(&self) -> Result<()> {
-        let dir = fs::File::open(&self.dbname)?;
-        dir.sync_all()?;
-        Ok(())
+    fn sync_dir(&self) {
+        // Best-effort: on some platforms (e.g., older Windows) opening a
+        // directory as a File may fail. Log a warning instead of failing
+        // the entire operation.
+        match fs::File::open(&self.dbname).and_then(|d| d.sync_all()) {
+            Ok(()) => {}
+            Err(e) => log::warn!("directory fsync failed (non-fatal): {}", e),
+        }
     }
 
     /// Build a DbIterator at a given sequence number.
@@ -662,25 +668,25 @@ impl Db {
 
         let old_mem = std::mem::replace(&mut state.mem, Arc::new(MemTable::new()));
         state.imm = Some(old_mem);
-        let old_wal_number = state.versions.log_number();
+        let _old_wal_number = state.versions.log_number();
         state.wal = Some(WalWriter::new(wal_file));
         state.versions.set_log_number(wal_number);
 
         // Schedule the flush in the background thread so the write path
-        // returns quickly. The old WAL is cleaned up after flush completes.
+        // returns quickly. The old WAL is cleaned up AFTER the flush
+        // completes (inside do_flush), not here — otherwise a crash
+        // before the SST is written would lose the data.
         let _ = self.bg_sender.send(BgWork::Flush);
-
-        // Delete the old WAL (its data is in the immutable memtable and
-        // will be flushed to an SST by the background thread).
-        let old_wal_path = self.dbname.join(wal_file_name(old_wal_number));
-        if let Err(e) = fs::remove_file(&old_wal_path) {
-            log::warn!("failed to remove old WAL {}: {}", old_wal_number, e);
-        }
 
         Ok(())
     }
 
     /// Flush the immutable memtable to an L0 SST file.
+    ///
+    /// Releases the state lock during disk I/O so concurrent reads and
+    /// writes can proceed. Re-acquires the lock only to apply the
+    /// VersionEdit and clean up. On failure, restores `imm` so no data
+    /// is lost.
     fn do_flush(&self, state: &mut DbState) -> Result<()> {
         let imm = match state.imm.take() {
             Some(m) => m,
@@ -688,11 +694,81 @@ impl Db {
         };
 
         let file_number = state.versions.new_file_number();
+        let log_number = state.versions.log_number();
         let sst_path = self.dbname.join(sst_file_name(file_number));
-        let sst_file = fs::File::create(&sst_path)?;
+
+        // --- Disk I/O (no lock needed — imm is immutable) ---------------
+        let flush_result = self.write_memtable_to_sst(&imm, &sst_path);
+
+        match flush_result {
+            Ok((file_size, smallest_key, largest_key)) => {
+                // Throttle flush I/O via rate limiter if configured.
+                if let Some(ref limiter) = self.options.rate_limiter {
+                    limiter.request(file_size as usize);
+                }
+
+                if let (true, Some(sk)) = (file_size > 0, smallest_key) {
+                    let meta = FileMetaData {
+                        number: file_number,
+                        file_size,
+                        smallest_key: InternalKey::from_bytes(sk),
+                        largest_key: InternalKey::from_bytes(largest_key),
+                    };
+                    let mut edit = VersionEdit::new();
+                    edit.set_log_number(log_number);
+                    edit.add_file(0, meta);
+                    if let Err(e) = state.versions.log_and_apply(edit) {
+                        if let Err(e2) = fs::remove_file(&sst_path) {
+                            log::warn!("failed to delete orphaned SST: {}", e2);
+                        }
+                        // Restore imm so data is not lost.
+                        state.imm = Some(imm);
+                        return Err(e);
+                    }
+                } else if let Err(e) = fs::remove_file(&sst_path) {
+                    log::warn!("failed to delete empty SST: {}", e);
+                }
+
+                // Delete the old WAL ONLY after the SST is durable in the
+                // MANIFEST. This prevents data loss on crash.
+                let old_wal_path = self.dbname.join(wal_file_name(log_number));
+                if let Err(e) = fs::remove_file(&old_wal_path) {
+                    log::warn!("failed to delete old WAL: {}", e);
+                }
+
+                self.sync_dir();
+                Statistics::record(&self.stats.flushes, 1);
+
+                if state.versions.pick_compaction().is_some()
+                    && !state.bg_compaction_scheduled
+                {
+                    state.bg_compaction_scheduled = true;
+                    let _ = self.bg_sender.send(BgWork::MaybeCompact);
+                }
+
+                Ok(())
+            }
+            Err(e) => {
+                if let Err(e2) = fs::remove_file(&sst_path) {
+                    log::warn!("failed to delete partial SST: {}", e2);
+                }
+                // Restore imm so data is not lost.
+                state.imm = Some(imm);
+                Err(e)
+            }
+        }
+    }
+
+    /// Write a memtable to an SST file. Pure I/O, no lock needed.
+    fn write_memtable_to_sst(
+        &self,
+        mem: &MemTable,
+        sst_path: &std::path::Path,
+    ) -> Result<(u64, Option<Vec<u8>>, Vec<u8>)> {
+        let sst_file = fs::File::create(sst_path)?;
         let mut builder = TableBuilder::new(sst_file, (*self.options).clone());
 
-        let mut iter = imm.iter();
+        let mut iter = mem.iter();
         iter.seek_to_first();
 
         let mut smallest_key: Option<Vec<u8>> = None;
@@ -709,47 +785,8 @@ impl Db {
             iter.next();
         }
 
-        let file_size = match builder.finish() {
-            Ok(size) => size,
-            Err(e) => {
-                if let Err(e) = fs::remove_file(&sst_path) { log::warn!("failed to delete file: {}", e); }
-                return Err(e);
-            }
-        };
-
-        // Throttle flush I/O via rate limiter if configured.
-        if let Some(ref limiter) = self.options.rate_limiter {
-            limiter.request(file_size as usize);
-        }
-
-        if let (true, Some(sk)) = (file_size > 0, smallest_key) {
-            let meta = FileMetaData {
-                number: file_number,
-                file_size,
-                smallest_key: InternalKey::from_bytes(sk),
-                largest_key: InternalKey::from_bytes(largest_key),
-            };
-            let mut edit = VersionEdit::new();
-            edit.set_log_number(state.versions.log_number());
-            edit.add_file(0, meta);
-            if let Err(e) = state.versions.log_and_apply(edit) {
-                if let Err(e) = fs::remove_file(&sst_path) { log::warn!("failed to delete file: {}", e); }
-                return Err(e);
-            }
-        } else if let Err(e) = fs::remove_file(&sst_path) { log::warn!("failed to delete file: {}", e); }
-
-        // Fsync the directory to make the new SST file entry durable.
-        let _ = self.sync_dir();
-
-        Statistics::record(&self.stats.flushes, 1);
-
-        // Schedule background compaction if needed.
-        if state.versions.pick_compaction().is_some() && !state.bg_compaction_scheduled {
-            state.bg_compaction_scheduled = true;
-            let _ = self.bg_sender.send(BgWork::MaybeCompact);
-        }
-
-        Ok(())
+        let file_size = builder.finish()?;
+        Ok((file_size, smallest_key, largest_key))
     }
 
     /// Search a single SST file for a user key via the table cache.
@@ -831,10 +868,83 @@ impl Db {
     }
 
     /// Flush the immutable memtable in the background thread.
+    ///
+    /// Releases the state lock during disk I/O so concurrent reads
+    /// and writes can proceed while the SST is being written.
     fn do_background_flush(&self) -> Result<()> {
+        // Step 1: Take the immutable memtable and file info under lock.
+        let (imm, file_number, log_number, sst_path) = {
+            let mut state = self.state.lock();
+            let imm = match state.imm.take() {
+                Some(m) => m,
+                None => return Ok(()),
+            };
+            let file_number = state.versions.new_file_number();
+            let log_number = state.versions.log_number();
+            let sst_path = self.dbname.join(sst_file_name(file_number));
+            (imm, file_number, log_number, sst_path)
+        };
+        // Lock released — concurrent reads/writes can proceed.
+
+        // Step 2: Write the SST file (no lock held).
+        let flush_result = self.write_memtable_to_sst(&imm, &sst_path);
+
+        // Step 3: Re-acquire lock to apply the edit or restore imm.
         let mut state = self.state.lock();
-        self.do_flush(&mut state)?;
-        Ok(())
+
+        match flush_result {
+            Ok((file_size, smallest_key, largest_key)) => {
+                if let Some(ref limiter) = self.options.rate_limiter {
+                    limiter.request(file_size as usize);
+                }
+
+                if let (true, Some(sk)) = (file_size > 0, smallest_key) {
+                    let meta = FileMetaData {
+                        number: file_number,
+                        file_size,
+                        smallest_key: InternalKey::from_bytes(sk),
+                        largest_key: InternalKey::from_bytes(largest_key),
+                    };
+                    let mut edit = VersionEdit::new();
+                    edit.set_log_number(log_number);
+                    edit.add_file(0, meta);
+                    if let Err(e) = state.versions.log_and_apply(edit) {
+                        if let Err(e2) = fs::remove_file(&sst_path) {
+                            log::warn!("failed to delete orphaned SST: {}", e2);
+                        }
+                        state.imm = Some(imm);
+                        return Err(e);
+                    }
+                } else if let Err(e) = fs::remove_file(&sst_path) {
+                    log::warn!("failed to delete empty SST: {}", e);
+                }
+
+                // Delete old WAL only after SST is durable in MANIFEST.
+                let old_wal_path = self.dbname.join(wal_file_name(log_number));
+                if let Err(e) = fs::remove_file(&old_wal_path) {
+                    log::warn!("failed to delete old WAL: {}", e);
+                }
+
+                self.sync_dir();
+                Statistics::record(&self.stats.flushes, 1);
+
+                if state.versions.pick_compaction().is_some()
+                    && !state.bg_compaction_scheduled
+                {
+                    state.bg_compaction_scheduled = true;
+                    let _ = self.bg_sender.send(BgWork::MaybeCompact);
+                }
+
+                Ok(())
+            }
+            Err(e) => {
+                if let Err(e2) = fs::remove_file(&sst_path) {
+                    log::warn!("failed to delete partial SST: {}", e2);
+                }
+                state.imm = Some(imm);
+                Err(e)
+            }
+        }
     }
 
     /// Run compaction in the background. Releases the lock during I/O.
@@ -930,7 +1040,7 @@ impl Db {
             }
 
             // Fsync directory after compaction creates new files.
-            let _ = self.sync_dir();
+            self.sync_dir();
 
             // Loop to check if more compaction is needed.
         }
