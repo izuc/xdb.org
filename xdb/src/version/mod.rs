@@ -18,6 +18,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Maximum MANIFEST file size before rotating to a new one.
+const MAX_MANIFEST_SIZE: u64 = 4 * 1024 * 1024; // 4 MiB
+
 // ---------------------------------------------------------------------------
 // Version
 // ---------------------------------------------------------------------------
@@ -200,6 +203,12 @@ impl VersionSet {
 
         // Install the new version.
         self.current = Arc::new(new_version);
+
+        // Rotate MANIFEST if it's grown too large. This creates a new
+        // MANIFEST with a fresh snapshot, ensuring recovery is fast and
+        // old MANIFEST files can be cleaned up.
+        self.maybe_rotate_manifest()?;
+
         Ok(())
     }
 
@@ -380,6 +389,31 @@ impl VersionSet {
         }
 
         best_level.map(|l| (l, best_score))
+    }
+
+    /// Rotate the MANIFEST file if it has grown too large.
+    ///
+    /// Creates a new MANIFEST with a full snapshot and updates CURRENT.
+    /// The old MANIFEST is deleted (best effort).
+    fn maybe_rotate_manifest(&mut self) -> Result<()> {
+        let manifest_path = self.dbname.join(manifest_file_name(self.manifest_file_number));
+        let size = fs::metadata(&manifest_path).map(|m| m.len()).unwrap_or(0);
+        if size < MAX_MANIFEST_SIZE {
+            return Ok(());
+        }
+
+        // Close current writer and create a new MANIFEST with a full snapshot.
+        let old_manifest_number = self.manifest_file_number;
+        self.manifest_writer = None; // Drop old writer
+        self.write_snapshot()?; // Creates new MANIFEST + updates CURRENT
+
+        // Delete the old MANIFEST file (best effort).
+        let old_path = self.dbname.join(manifest_file_name(old_manifest_number));
+        if let Err(e) = fs::remove_file(&old_path) {
+            log::warn!("failed to remove old MANIFEST: {}", e);
+        }
+
+        Ok(())
     }
 
     /// Write a full snapshot of the current version to a new MANIFEST file.

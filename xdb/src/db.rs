@@ -36,6 +36,7 @@ use crate::wal::WalWriter;
 
 use crossbeam_channel::Sender;
 use parking_lot::{Mutex, RwLock};
+use fs4::fs_std::FileExt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -119,6 +120,11 @@ impl Db {
 
         let lock_path = dbname.join(LOCK_FILE_NAME);
         let lock_file = fs::File::create(&lock_path)?;
+        lock_file.try_lock_exclusive().map_err(|e| {
+            Error::Io(std::io::Error::other(
+                format!("database {:?} is locked by another process: {}", dbname, e),
+            ))
+        })?;
 
         let opts = Arc::new(options);
 
@@ -746,6 +752,13 @@ impl Db {
         // completes (inside do_flush), not here — otherwise a crash
         // before the SST is written would lose the data.
         let _ = self.bg_sender.send(BgWork::Flush);
+
+        // Proactively trigger compaction if L0 is getting full.
+        let l0_count = state.versions.current().files_at_level(0).len();
+        if l0_count >= self.options.level0_compaction_trigger && !state.bg_compaction_scheduled {
+            state.bg_compaction_scheduled = true;
+            let _ = self.bg_sender.send(BgWork::MaybeCompact);
+        }
 
         Ok(())
     }
