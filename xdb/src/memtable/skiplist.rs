@@ -290,7 +290,7 @@ impl MemTable {
     /// - `Some(Ok(value))` if the key was found with `ValueType::Value`.
     /// - `Some(Err(NotFound))` if the key was found with `ValueType::Deletion`.
     /// - `None` if the key is not present in this memtable.
-    pub fn get(&self, lookup_key: &LookupKey) -> Option<error::Result<Vec<u8>>> {
+    pub fn get(&self, lookup_key: &LookupKey) -> Option<error::Result<(Vec<u8>, SequenceNumber)>> {
         // Fast path: skip the full 12-level skiplist descent for empty tables.
         if self.list.first_node().is_null() {
             return None;
@@ -328,12 +328,12 @@ impl MemTable {
                     return None; // no version at this snapshot
                 }
                 let cur_tag = extract_tag(cur_key);
-                if tag_sequence(cur_tag) <= lookup_seq {
-                    // Found a version within our snapshot.
+                let cur_seq = tag_sequence(cur_tag);
+                if cur_seq <= lookup_seq {
                     return match tag_value_type(cur_tag) {
                         Some(ValueType::Value) => {
                             let value = unsafe { (*cur).value.clone() };
-                            Some(Ok(value))
+                            Some(Ok((value, cur_seq)))
                         }
                         Some(ValueType::Deletion) | Some(ValueType::RangeDeletion) => {
                             Some(Err(error::Error::not_found(
@@ -351,7 +351,7 @@ impl MemTable {
         match tag_value_type(tag) {
             Some(ValueType::Value) => {
                 let value = unsafe { (*node).value.clone() };
-                Some(Ok(value))
+                Some(Ok((value, node_seq)))
             }
             Some(ValueType::Deletion) | Some(ValueType::RangeDeletion) => {
                 Some(Err(error::Error::not_found(
@@ -578,11 +578,11 @@ mod tests {
         mt.add(2, ValueType::Value, b"key2", b"value2");
 
         let lk1 = LookupKey::new(b"key1", 1);
-        let result = mt.get(&lk1).unwrap().unwrap();
+        let (result, _seq) = mt.get(&lk1).unwrap().unwrap();
         assert_eq!(result, b"value1");
 
         let lk2 = LookupKey::new(b"key2", 2);
-        let result = mt.get(&lk2).unwrap().unwrap();
+        let (result, _seq) = mt.get(&lk2).unwrap().unwrap();
         assert_eq!(result, b"value2");
     }
 
@@ -601,14 +601,12 @@ mod tests {
         mt.add(1, ValueType::Value, b"key", b"old");
         mt.add(2, ValueType::Value, b"key", b"new");
 
-        // Reading at seq=2 should see "new".
         let lk = LookupKey::new(b"key", 2);
-        let result = mt.get(&lk).unwrap().unwrap();
+        let (result, _) = mt.get(&lk).unwrap().unwrap();
         assert_eq!(result, b"new");
 
-        // Reading at seq=1 should see "old".
         let lk1 = LookupKey::new(b"key", 1);
-        let result = mt.get(&lk1).unwrap().unwrap();
+        let (result, _) = mt.get(&lk1).unwrap().unwrap();
         assert_eq!(result, b"old");
     }
 
@@ -624,9 +622,8 @@ mod tests {
         assert!(result.is_some());
         assert!(result.unwrap().is_err());
 
-        // Reading at seq=1 should still see the value.
         let lk1 = LookupKey::new(b"key", 1);
-        let result = mt.get(&lk1).unwrap().unwrap();
+        let (result, _) = mt.get(&lk1).unwrap().unwrap();
         assert_eq!(result, b"value");
     }
 

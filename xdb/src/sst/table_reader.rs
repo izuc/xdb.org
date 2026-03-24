@@ -21,8 +21,8 @@ const BLOCK_TRAILER_SIZE: usize = 5;
 
 /// Result of a user-key lookup that accounts for sequence numbers and deletions.
 pub enum UserKeyResult {
-    /// The key was found with this value.
-    Found(Vec<u8>),
+    /// The key was found with this value and sequence number.
+    Found(Vec<u8>, u64),
     /// The key was found as a deletion tombstone.
     Deleted,
 }
@@ -258,7 +258,7 @@ impl TableReader {
                 if parsed.user_key == user_key && parsed.sequence <= sequence {
                     return match parsed.value_type {
                         ValueType::Value => {
-                            Ok(Some(UserKeyResult::Found(data_iter.value().to_vec())))
+                            Ok(Some(UserKeyResult::Found(data_iter.value().to_vec(), parsed.sequence)))
                         }
                         ValueType::Deletion | ValueType::RangeDeletion => {
                             Ok(Some(UserKeyResult::Deleted))

@@ -267,12 +267,12 @@ impl Db {
         if let Some(result) = mem.get(&lookup) {
             Statistics::record(&self.stats.memtable_hits, 1);
             return match result {
-                Ok(value) => {
+                Ok((value, value_seq)) => {
                     if mem_has_tombstones {
                         let range_tombstones = self.collect_range_tombstones_for_get(
                             key, &mem, imm.as_deref(), &version, sequence,
                         );
-                        if Self::is_key_range_deleted(key, sequence, &range_tombstones) {
+                        if Self::is_key_range_deleted(key, value_seq, &range_tombstones) {
                             return Ok(None);
                         }
                     }
@@ -289,12 +289,12 @@ impl Db {
             if let Some(result) = imm_table.get(&lookup) {
                 Statistics::record(&self.stats.memtable_hits, 1);
                 return match result {
-                    Ok(value) => {
+                    Ok((value, value_seq)) => {
                         if mem_has_tombstones {
                             let range_tombstones = self.collect_range_tombstones_for_get(
                                 key, &mem, imm.as_deref(), &version, sequence,
                             );
-                            if Self::is_key_range_deleted(key, sequence, &range_tombstones) {
+                            if Self::is_key_range_deleted(key, value_seq, &range_tombstones) {
                                 return Ok(None);
                             }
                         }
@@ -317,11 +317,10 @@ impl Db {
                 continue;
             }
             match self.search_sst_file(file_meta, key, sequence)? {
-                SearchResult::Found(value) => {
-                    // Lazily check range tombstones only when a value is found.
+                SearchResult::Found(value, value_seq) => {
                     if self.check_range_tombstones_for_found_key(
-                        key, sequence, mem_has_tombstones, &mem, imm.as_deref(),
-                        &version,
+                        key, value_seq, mem_has_tombstones, &mem, imm.as_deref(),
+                        &version, sequence,
                     )? {
                         return Ok(None);
                     }
@@ -347,10 +346,10 @@ impl Db {
                 continue;
             }
             match self.search_sst_file(file_meta, key, sequence)? {
-                SearchResult::Found(value) => {
+                SearchResult::Found(value, value_seq) => {
                     if self.check_range_tombstones_for_found_key(
-                        key, sequence, mem_has_tombstones, &mem, imm.as_deref(),
-                        &version,
+                        key, value_seq, mem_has_tombstones, &mem, imm.as_deref(),
+                        &version, sequence,
                     )? {
                         return Ok(None);
                     }
@@ -373,11 +372,12 @@ impl Db {
     fn check_range_tombstones_for_found_key(
         &self,
         user_key: &[u8],
-        sequence: SequenceNumber,
+        value_seq: SequenceNumber,
         mem_has_tombstones: bool,
         mem: &MemTable,
         imm: Option<&MemTable>,
         version: &Version,
+        snapshot_seq: SequenceNumber,
     ) -> Result<bool> {
         // Fast path: if no memtable has tombstones, check whether ANY
         // SST file has cached tombstones before doing the full scan.
@@ -405,10 +405,12 @@ impl Db {
         }
 
         // Slow path: tombstones exist somewhere, do the full collection.
+        // Use snapshot_seq to find all visible tombstones, then check if
+        // any of those tombstones cover the value (using value_seq).
         let range_tombstones = self.collect_range_tombstones_for_get(
-            user_key, mem, imm, version, sequence,
+            user_key, mem, imm, version, snapshot_seq,
         );
-        Ok(Self::is_key_range_deleted(user_key, sequence, &range_tombstones))
+        Ok(Self::is_key_range_deleted(user_key, value_seq, &range_tombstones))
     }
 
     /// Apply a `WriteBatch` atomically.
@@ -695,16 +697,18 @@ impl Db {
         tombstones
     }
 
-    /// Check whether a user key is covered by any collected range tombstone.
+    /// Check whether a user key at a given value sequence is covered by a
+    /// range tombstone. A tombstone only covers values whose sequence is
+    /// OLDER (lower) than the tombstone's sequence.
     fn is_key_range_deleted(
         user_key: &[u8],
-        sequence: SequenceNumber,
+        value_seq: SequenceNumber,
         tombstones: &[(Vec<u8>, Vec<u8>, SequenceNumber)],
     ) -> bool {
         for (start, end, tomb_seq) in tombstones {
             if user_key >= start.as_slice()
                 && user_key < end.as_slice()
-                && *tomb_seq <= sequence
+                && *tomb_seq > value_seq
             {
                 return true;
             }
@@ -872,9 +876,9 @@ impl Db {
         }
 
         match reader.get_for_user_key(user_key, sequence)? {
-            Some(crate::sst::UserKeyResult::Found(value)) => {
+            Some(crate::sst::UserKeyResult::Found(value, value_seq)) => {
                 Statistics::record(&self.stats.bytes_read, value.len() as u64);
-                Ok(SearchResult::Found(value))
+                Ok(SearchResult::Found(value, value_seq))
             }
             Some(crate::sst::UserKeyResult::Deleted) => Ok(SearchResult::Deleted),
             None => Ok(SearchResult::NotFound),
@@ -1308,7 +1312,7 @@ impl Drop for Db {
 // ---------------------------------------------------------------------------
 
 enum SearchResult {
-    Found(Vec<u8>),
+    Found(Vec<u8>, SequenceNumber),
     Deleted,
     NotFound,
 }
