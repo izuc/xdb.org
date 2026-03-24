@@ -92,6 +92,15 @@ struct DbState {
 impl Db {
     /// Open a database at the given path.
     pub fn open(options: Options, path: impl AsRef<Path>) -> Result<Arc<Self>> {
+        Self::open_with_cf_map(options, path, None)
+    }
+
+    /// Internal open that accepts an optional column family map.
+    fn open_with_cf_map(
+        options: Options,
+        path: impl AsRef<Path>,
+        cf_map: Option<crate::column_family::ColumnFamilyMap>,
+    ) -> Result<Arc<Self>> {
         let dbname = path.as_ref().to_path_buf();
 
         // Validate options.
@@ -204,7 +213,7 @@ impl Db {
             bg_sender,
             _bg_handle: Mutex::new(None),
             _lock_file: lock_file,
-            cf_map: None,
+            cf_map,
         });
 
         // Spawn background thread for compaction and flush.
@@ -219,8 +228,6 @@ impl Db {
         Ok(db)
     }
 
-    /// Destroy a database by removing all files in its directory.
-    ///
     /// Open a database with column family support.
     ///
     /// Column families provide logical table namespacing. Each family is
@@ -240,10 +247,9 @@ impl Db {
     {
         let descriptors: Vec<_> = cfs.into_iter().collect();
         let cf_map = crate::column_family::ColumnFamilyMap::new(&descriptors);
-        let mut db = Self::open(options, path)?;
-        // Safety: we just created the Arc and have the only reference.
-        Arc::get_mut(&mut db).unwrap().cf_map = Some(cf_map);
-        Ok(db)
+        // Use open_with_cf_map to inject the CF map before the background
+        // thread is spawned, avoiding a race on Arc::get_mut.
+        Self::open_with_cf_map(options, path, Some(cf_map))
     }
 
     /// Get a handle to a column family by name.
