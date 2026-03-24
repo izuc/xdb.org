@@ -106,31 +106,10 @@ pub fn compact(
 ) -> Result<VersionEdit> {
     let mut edit = VersionEdit::new();
 
-    // Collect range tombstones from input files.
-    let mut range_tombstones: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new(); // (start, end, sequence)
-
-    for files in &state.input_files {
-        for file_meta in files {
-            let path = dbname.join(sst_file_name(file_meta.number));
-            let f = fs::File::open(&path)?;
-            let file_size = f.metadata()?.len();
-            let reader = TableReader::open(f, file_size, options.clone())?;
-            let entries = reader.iter_entries()?;
-            for (key, value) in &entries {
-                if let Some(parsed) = ParsedInternalKey::from_bytes(key) {
-                    if parsed.value_type == ValueType::RangeDeletion {
-                        range_tombstones.push((
-                            parsed.user_key.to_vec(),
-                            value.clone(),
-                            parsed.sequence,
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    // Open all input files and create iterators.
+    // Open all input files and collect range tombstones + streaming iterators
+    // in a single pass. Uses TableReader::iter() (streaming) instead of
+    // iter_entries() (loads all into Vec) to avoid OOM on large compactions.
+    let mut range_tombstones: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new();
     let mut iters: Vec<Box<dyn XdbIterator>> = Vec::new();
 
     for files in &state.input_files {
@@ -139,12 +118,18 @@ pub fn compact(
             let f = fs::File::open(&path)?;
             let file_size = f.metadata()?.len();
             let reader = TableReader::open(f, file_size, options.clone())?;
-            let entries = reader.iter_entries()?;
-            iters.push(Box::new(VecIterator::new(entries)));
+            // Use cached range tombstones (parsed at open time).
+            for (start, end, tomb_seq) in reader.range_tombstones() {
+                range_tombstones.push((start.clone(), end.clone(), *tomb_seq));
+            }
+            // Use streaming iterator — reads blocks on demand, not all into memory.
+            iters.push(Box::new(reader.iter()));
         }
     }
 
-    // Merge all iterators into a single sorted stream.
+    // Sort range tombstones by start key for efficient lookup.
+    range_tombstones.sort_by(|a, b| a.0.cmp(&b.0));
+
     let mut merger = MergingIterator::new(iters);
     merger.seek_to_first();
 
@@ -160,34 +145,42 @@ pub fn compact(
         let key = merger.key();
         let value = merger.value();
 
-        // Skip duplicate user keys: keep only the newest (first encountered).
         let user_key = extract_user_key(key);
-        if user_key == last_user_key.as_slice() && !last_user_key.is_empty() {
-            merger.next();
-            continue;
-        }
-        last_user_key = user_key.to_vec();
-
-        // Extract tag information for range tombstone and deletion checks.
         let tag = extract_tag(key);
         let seq = tag_sequence(tag);
         let vt = tag_value_type(tag);
 
-        // Range tombstone entries themselves are passed through to output.
-        if vt == Some(ValueType::RangeDeletion) {
-            // Fall through to the add logic below.
-        } else {
-            // Check if this key is covered by a range tombstone.
-            let mut is_range_deleted = false;
-            for (start, end, tomb_seq) in &range_tombstones {
-                if user_key >= start.as_slice()
-                    && user_key < end.as_slice()
-                    && *tomb_seq >= seq
-                {
-                    is_range_deleted = true;
-                    break;
-                }
+        // Range tombstones are EXCLUDED from point-key deduplication.
+        // A RangeDeletion with user_key "apple" (meaning "delete range
+        // starting at apple") must not suppress a Put("apple") entry.
+        let is_range_tombstone = vt == Some(ValueType::RangeDeletion);
+
+        if !is_range_tombstone {
+            // Skip duplicate user keys: keep only the newest (first encountered).
+            if user_key == last_user_key.as_slice() && !last_user_key.is_empty() {
+                merger.next();
+                continue;
             }
+            last_user_key = user_key.to_vec();
+
+            // Check if this key is covered by a range tombstone.
+            // Uses binary search on the sorted tombstone list to find
+            // candidates efficiently instead of scanning all tombstones.
+            let is_range_deleted = range_tombstones
+                .partition_point(|(start, _, _)| start.as_slice() <= user_key)
+                .checked_sub(1)
+                .map(|idx| {
+                    // Check tombstones from idx downward that could cover user_key.
+                    (0..=idx).rev().any(|i| {
+                        let (start, end, tomb_seq) = &range_tombstones[i];
+                        if start.as_slice() > user_key {
+                            return false;
+                        }
+                        user_key < end.as_slice() && *tomb_seq >= seq
+                    })
+                })
+                .unwrap_or(false);
+
             if is_range_deleted {
                 merger.next();
                 continue;
@@ -197,10 +190,11 @@ pub fn compact(
         // Drop deletion and range-deletion tombstones at the bottom level
         // where no older files could still reference the key.
         if matches!(vt, Some(ValueType::Deletion) | Some(ValueType::RangeDeletion))
-            && target_level == options.num_levels - 1 {
-                merger.next();
-                continue;
-            }
+            && target_level == options.num_levels - 1
+        {
+            merger.next();
+            continue;
+        }
 
         // Start a new output file if needed.
         if current_builder.is_none() {
@@ -263,54 +257,3 @@ pub fn compact(
     Ok(edit)
 }
 
-// ---------------------------------------------------------------------------
-// VecIterator — simple in-memory iterator for compaction input
-// ---------------------------------------------------------------------------
-
-/// A vector-based iterator over pre-loaded key-value pairs.
-///
-/// Used to wrap the entries read from a `TableReader` so they can be fed
-/// into a `MergingIterator`.
-struct VecIterator {
-    entries: Vec<(Vec<u8>, Vec<u8>)>,
-    pos: usize,
-}
-
-impl VecIterator {
-    fn new(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
-        VecIterator {
-            entries,
-            pos: usize::MAX, // invalid until seek
-        }
-    }
-}
-
-impl XdbIterator for VecIterator {
-    fn valid(&self) -> bool {
-        self.pos < self.entries.len()
-    }
-
-    fn seek_to_first(&mut self) {
-        self.pos = 0;
-    }
-
-    fn seek(&mut self, target: &[u8]) {
-        self.pos = self
-            .entries
-            .partition_point(|(k, _)| compare_internal_key(k, target) == std::cmp::Ordering::Less);
-    }
-
-    fn next(&mut self) {
-        if self.valid() {
-            self.pos += 1;
-        }
-    }
-
-    fn key(&self) -> &[u8] {
-        &self.entries[self.pos].0
-    }
-
-    fn value(&self) -> &[u8] {
-        &self.entries[self.pos].1
-    }
-}

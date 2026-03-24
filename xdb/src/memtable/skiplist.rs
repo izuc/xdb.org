@@ -104,8 +104,15 @@ impl SkipList {
     /// hot write path.
     fn random_height() -> usize {
         use std::cell::Cell;
+        use std::hash::{Hash, Hasher};
         thread_local! {
-            static RNG: Cell<u32> = const { Cell::new(0xdeadbeef) };
+            static RNG: Cell<u32> = {
+                // Seed from thread ID so each thread produces a unique sequence.
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::thread::current().id().hash(&mut hasher);
+                let seed = hasher.finish() as u32;
+                Cell::new(if seed == 0 { 0xdeadbeef } else { seed })
+            };
         }
         let mut height = 1;
         RNG.with(|rng| {

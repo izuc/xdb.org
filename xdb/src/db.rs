@@ -1004,8 +1004,16 @@ impl Db {
                 continue;
             }
 
-            let sequence = u64::from_le_bytes(data[0..8].try_into().unwrap());
-            let count = u32::from_le_bytes(data[8..12].try_into().unwrap());
+            let sequence = u64::from_le_bytes(
+                data[0..8]
+                    .try_into()
+                    .map_err(|_| Error::corruption("truncated WAL batch header"))?,
+            );
+            let count = u32::from_le_bytes(
+                data[8..12]
+                    .try_into()
+                    .map_err(|_| Error::corruption("truncated WAL batch header"))?,
+            );
 
             let mut seq = sequence;
             let mut pos = 12;
