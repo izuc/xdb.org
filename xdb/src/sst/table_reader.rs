@@ -41,6 +41,9 @@ pub struct TableReader {
     /// Cached range tombstones: (start_user_key, end_user_key, sequence).
     /// Parsed once at open time so point lookups don't need to scan the file.
     range_tombstones: Vec<(Vec<u8>, Vec<u8>, u64)>,
+    /// Block offsets whose CRC32 has been verified. Subsequent reads to
+    /// the same block skip the ~100-150ns CRC computation.
+    verified_blocks: parking_lot::Mutex<std::collections::HashSet<u64>>,
     #[allow(dead_code)]
     options: Options,
 }
@@ -98,6 +101,7 @@ impl TableReader {
             index_block,
             filter_data,
             range_tombstones,
+            verified_blocks: parking_lot::Mutex::new(std::collections::HashSet::new()),
             options,
         })
     }
@@ -292,6 +296,27 @@ impl TableReader {
             )));
         }
 
+        // Fast path: if this block's CRC was already verified, skip the
+        // ~100-150ns CRC32 computation entirely.
+        let already_verified = self.verified_blocks.lock().contains(&handle.offset);
+
+        if already_verified {
+            let trailer = &self.data[offset + size..offset + total];
+            let compression_type = trailer[0];
+            if compression_type == compression::COMPRESSION_NONE {
+                return BlockReader::from_shared(
+                    Arc::clone(&self.data),
+                    offset,
+                    offset + size,
+                );
+            }
+            // Compressed block that was verified before — still need to decompress.
+            let block_data = &self.data[offset..offset + size];
+            let decompressed = compression::decompress(block_data, compression_type)?;
+            return BlockReader::new(decompressed);
+        }
+
+        // Slow path: verify CRC32 then cache the result.
         let block_data = &self.data[offset..offset + size];
         let trailer = &self.data[offset + size..offset + total];
 
@@ -310,8 +335,10 @@ impl TableReader {
             )));
         }
 
+        // Cache the verification so future reads skip CRC.
+        self.verified_blocks.lock().insert(handle.offset);
+
         if compression_type == compression::COMPRESSION_NONE {
-            // Zero-copy: borrow directly from the Arc<Vec<u8>> file buffer.
             BlockReader::from_shared(Arc::clone(&self.data), offset, offset + size)
         } else {
             // Compressed: must decompress into an owned buffer.
