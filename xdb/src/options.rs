@@ -135,11 +135,11 @@ impl Default for Options {
             create_if_missing: false,
             error_if_exists: false,
 
-            write_buffer_size: 64 * 1024 * 1024, // 64 MiB — handles 50 CFs with high write volume
-            max_write_buffer_number: 4, // 4 buffers — more room before synchronous flush stall
+            write_buffer_size: 256 * 1024 * 1024, // 256 MiB — large buffer for 50 CFs with sustained writes
+            max_write_buffer_number: 6, // 6 buffers — extensive room before synchronous flush
 
             num_levels: 7,
-            level0_compaction_trigger: 8, // Higher threshold — reduces compaction pressure under load
+            level0_compaction_trigger: 16, // High threshold — avoids compaction stalls under sustained load
             max_bytes_for_level_base: 64 * 1024 * 1024,
             max_bytes_for_level_multiplier: 10.0,
             target_file_size_base: 2 * 1024 * 1024,
