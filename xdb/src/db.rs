@@ -1583,12 +1583,10 @@ impl Db {
     fn do_background_compaction(&self) -> Result<()> {
         use crate::compaction;
 
-        // Limit rounds per batch to prevent compaction from starving readers.
-        // With parking_lot's writer-priority RwLock, each write lock
-        // acquisition (steps 1 and 3) blocks all pending readers. Running
-        // 32 rounds continuously created an effective reader starvation
-        // loop that froze consensus in blockchain workloads.
-        const MAX_COMPACTION_ROUNDS: usize = 4;
+        // One round per batch — gives the system a full second of
+        // uncontested read/write access between compaction rounds.
+        // Multiple rounds per batch caused 100% CPU and starved consensus.
+        const MAX_COMPACTION_ROUNDS: usize = 1;
 
         for _round in 0..MAX_COMPACTION_ROUNDS {
             // Abort early if the database is shutting down so close()
@@ -1690,15 +1688,16 @@ impl Db {
             // Loop to check if more compaction is needed.
         }
 
-        // If we hit the round limit and there's still work, re-schedule
-        // after a brief pause. The 50ms gap lets reads and writes flow
-        // freely between compaction batches — critical for preventing
-        // consensus stalls in blockchain workloads.
+        // If there's still work, re-schedule after a full second.
+        // The 1s gap gives reads, writes, and consensus a long window of
+        // uncontested access. L0 files accumulate but reads still work
+        // (L0 is searched in parallel). Compaction catches up during
+        // quieter periods.
         if !self.shutting_down.load(AtomicOrdering::Acquire) {
             let state = self.state.read().expect("xdb: lock poisoned");
             if state.versions.pick_compaction().is_some() {
                 drop(state);
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_secs(1));
                 let _ = self.compact_sender.send(CompactWork::MaybeCompact);
             }
         }
