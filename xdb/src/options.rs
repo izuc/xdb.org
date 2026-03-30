@@ -135,11 +135,11 @@ impl Default for Options {
             create_if_missing: false,
             error_if_exists: false,
 
-            write_buffer_size: 4 * 1024 * 1024, // 4 MiB — very frequent tiny flushes keep L0 files small, so compaction (4×4MB=16MB) finishes in milliseconds instead of seconds
+            write_buffer_size: 32 * 1024 * 1024, // 32 MiB — delays compaction to ~270 rounds under blockchain load
             max_write_buffer_number: 4, // 4 buffers — allows background flush while writes continue
 
             num_levels: 7,
-            level0_compaction_trigger: 4, // Low trigger — small frequent compactions (4×32MB=128MB) instead of massive rare ones (16×32MB=512MB) that freeze the process
+            level0_compaction_trigger: 8, // Moderate trigger — 8×32MB=256MB compaction (balanced between frequency and size)
             max_bytes_for_level_base: 64 * 1024 * 1024,
             max_bytes_for_level_multiplier: 10.0,
             target_file_size_base: 2 * 1024 * 1024,
