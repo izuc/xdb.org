@@ -1465,15 +1465,18 @@ impl Db {
             match work {
                 CompactWork::Shutdown => break,
                 CompactWork::MaybeCompact => {
+                    // Compaction is deferred — let L0 files accumulate.
+                    // Reads still work (L0 is searched). This prevents
+                    // the compaction thread from consuming 100% CPU which
+                    // was freezing consensus at round ~17.
+                    // TODO: investigate why compact() runs indefinitely on
+                    // small (4MB) data sets and re-enable once fixed.
                     if let Some(db) = weak.upgrade() {
-                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            db.do_background_compaction()
-                        })) {
-                            Ok(Err(e)) => log::error!("compact worker: compaction failed: {}", e),
-                            Err(_) => log::error!("compact worker: compaction panicked"),
-                            _ => {}
+                        if db.shutting_down.load(AtomicOrdering::Acquire) {
+                            break;
                         }
                     }
+                    std::thread::sleep(std::time::Duration::from_secs(5));
                 }
             }
         }
