@@ -35,7 +35,13 @@ use crate::version::{Version, VersionSet};
 use crate::wal::WalWriter;
 
 use crossbeam_channel::Sender;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
+// Use std RwLock instead of parking_lot — parking_lot's writer-priority
+// fairness blocks ALL readers when any writer is waiting, which caused
+// catastrophic read starvation during compaction in blockchain workloads.
+// std::sync::RwLock doesn't have writer-priority on most platforms,
+// so readers always proceed even during write contention.
+use std::sync::RwLock;
 use fs4::fs_std::FileExt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -432,7 +438,7 @@ impl Db {
     /// For definitive existence checks, use `get()`.
     pub fn key_may_exist(&self, key: &[u8]) -> bool {
         let (mem, imm, version, sequence) = {
-            let state = self.state.read();
+            let state = self.state.read().expect("xdb: lock poisoned");
             (
                 Arc::clone(&state.mem),
                 state.imm.as_ref().map(Arc::clone),
@@ -504,7 +510,7 @@ impl Db {
         Statistics::record(&self.stats.reads, 1);
 
         let (mem, imm, version, sequence) = {
-            let state = self.state.read();
+            let state = self.state.read().expect("xdb: lock poisoned");
             (
                 Arc::clone(&state.mem),
                 state.imm.as_ref().map(Arc::clone),
@@ -529,7 +535,7 @@ impl Db {
         }
 
         let (mem, imm, version, sequence) = {
-            let state = self.state.read();
+            let state = self.state.read().expect("xdb: lock poisoned");
             (
                 Arc::clone(&state.mem),
                 state.imm.as_ref().map(Arc::clone),
@@ -735,7 +741,7 @@ impl Db {
         // WITHOUT holding the write lock so readers are never blocked.
         self.ensure_write_room()?;
 
-        let mut state = self.state.write();
+        let mut state = self.state.write().expect("xdb: lock poisoned");
 
         // Double-check after acquiring the lock — another writer may have
         // already swapped the memtable while we were waiting.
@@ -751,7 +757,7 @@ impl Db {
             {
                 drop(state);
                 self.ensure_write_room()?;
-                state = self.state.write();
+                state = self.state.write().expect("xdb: lock poisoned");
             }
         }
 
@@ -797,7 +803,7 @@ impl Db {
 
         // Step 1: Swap memtable under brief write lock.
         {
-            let mut state = self.state.write();
+            let mut state = self.state.write().expect("xdb: lock poisoned");
             if state.mem.is_empty() && state.imm.is_none() {
                 return Ok(());
             }
@@ -817,7 +823,7 @@ impl Db {
     /// The snapshot can be used with `ReadOptions` to perform consistent reads.
     /// Drop or release the snapshot when no longer needed.
     pub fn snapshot(&self) -> Arc<Snapshot> {
-        let seq = self.state.read().versions.last_sequence();
+        let seq = self.state.read().expect("xdb: lock poisoned").versions.last_sequence();
         self.snapshots.create(seq)
     }
 
@@ -833,7 +839,7 @@ impl Db {
     /// Entries are yielded in user-key order with deletions hidden and
     /// duplicates resolved to the newest version.
     pub fn iter(&self) -> DbIterator {
-        let seq = self.state.read().versions.last_sequence();
+        let seq = self.state.read().expect("xdb: lock poisoned").versions.last_sequence();
         self.iter_at_sequence(seq)
     }
 
@@ -876,7 +882,7 @@ impl Db {
     /// - `"xdb.background-errors"` -- placeholder, always `"0"`
     /// - `"xdb.level-summary"` -- one-line summary like `"L0:3 L1:10 L2:45 ..."`
     pub fn get_property(&self, name: &str) -> Option<String> {
-        let state = self.state.read();
+        let state = self.state.read().expect("xdb: lock poisoned");
         let version = state.versions.current();
 
         match name {
@@ -921,7 +927,7 @@ impl Db {
         use crate::compaction;
 
         for level in 0..self.options.num_levels - 1 {
-            let mut state = self.state.write();
+            let mut state = self.state.write().expect("xdb: lock poisoned");
             let version = state.versions.current();
             let files = version.files_at_level(level);
 
@@ -972,7 +978,7 @@ impl Db {
             )?;
 
             // Re-acquire lock to apply edit.
-            let mut state = self.state.write();
+            let mut state = self.state.write().expect("xdb: lock poisoned");
             while state.versions.manifest_file_number() < next_file {
                 state.versions.new_file_number();
             }
@@ -1020,7 +1026,7 @@ impl Db {
             let _ = handle.join();
         }
 
-        let mut state = self.state.write();
+        let mut state = self.state.write().expect("xdb: lock poisoned");
         // Flush any pending immutable memtable first so it is not lost
         // when we overwrite state.imm below.
         if state.imm.is_some() {
@@ -1058,7 +1064,7 @@ impl Db {
     /// Build a DbIterator at a given sequence number.
     fn iter_at_sequence(&self, sequence: SequenceNumber) -> DbIterator {
         let (mem, imm, version) = {
-            let state = self.state.read();
+            let state = self.state.read().expect("xdb: lock poisoned");
             (
                 Arc::clone(&state.mem),
                 state.imm.as_ref().map(Arc::clone),
@@ -1212,7 +1218,7 @@ impl Db {
             if self.shutting_down.load(AtomicOrdering::Acquire) {
                 return Err(Error::ShutdownInProgress);
             }
-            if self.state.read().imm.is_none() {
+            if self.state.read().expect("xdb: lock poisoned").imm.is_none() {
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -1232,7 +1238,7 @@ impl Db {
                 return Err(Error::ShutdownInProgress);
             }
             {
-                let state = self.state.read();
+                let state = self.state.read().expect("xdb: lock poisoned");
                 if state.mem.approximate_memory_usage() < self.options.write_buffer_size {
                     return Ok(());
                 }
@@ -1245,7 +1251,7 @@ impl Db {
             }
             // Memtable is full but imm is clear — swap under brief write lock.
             {
-                let mut state = self.state.write();
+                let mut state = self.state.write().expect("xdb: lock poisoned");
                 // Re-check: another writer may have swapped while we waited.
                 if state.mem.approximate_memory_usage() < self.options.write_buffer_size {
                     return Ok(());
@@ -1484,7 +1490,7 @@ impl Db {
         let (imm, file_number, log_number, sst_path) = {
             let mut guard = None;
             for _ in 0..500 {
-                if let Some(g) = self.state.try_write() {
+                if let Ok(g) = self.state.try_write() {
                     guard = Some(g);
                     break;
                 }
@@ -1511,7 +1517,7 @@ impl Db {
         // Use try_write to avoid reader starvation.
         let mut guard = None;
         for _ in 0..1000 {
-            if let Some(g) = self.state.try_write() {
+            if let Ok(g) = self.state.try_write() {
                 guard = Some(g);
                 break;
             }
@@ -1633,7 +1639,7 @@ impl Db {
             let comp_info = {
                 let mut guard = None;
                 for _ in 0..500 {
-                    if let Some(g) = self.state.try_write() {
+                    if let Ok(g) = self.state.try_write() {
                         guard = Some(g);
                         break;
                     }
@@ -1694,7 +1700,7 @@ impl Db {
             let apply_result = {
                 let mut guard = None;
                 for _ in 0..500 {
-                    if let Some(g) = self.state.try_write() {
+                    if let Ok(g) = self.state.try_write() {
                         guard = Some(g);
                         break;
                     }
@@ -1743,7 +1749,7 @@ impl Db {
         // freely between compaction batches — critical for preventing
         // consensus stalls in blockchain workloads.
         if !self.shutting_down.load(AtomicOrdering::Acquire) {
-            let state = self.state.read();
+            let state = self.state.read().expect("xdb: lock poisoned");
             if state.versions.pick_compaction().is_some() {
                 drop(state);
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1997,7 +2003,7 @@ impl Db {
         // Flush to ensure all data is in SSTs.
         self.flush()?;
 
-        let state = self.state.read();
+        let state = self.state.read().expect("xdb: lock poisoned");
         let version = state.versions.current();
 
         fs::create_dir_all(checkpoint_path)?;
