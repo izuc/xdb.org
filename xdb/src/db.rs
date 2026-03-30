@@ -1603,10 +1603,10 @@ impl Db {
             }
 
             // Step 1: Pick compaction under lock.
-            // With std::sync::RwLock (no writer-priority), blocking write()
-            // is safe — it doesn't starve readers.
+            log::info!("compaction: acquiring write lock for pick");
             let comp_info = {
                 let mut state = self.state.write().expect("xdb: lock poisoned");
+                log::info!("compaction: lock acquired, picking");
                 state.bg_compaction_scheduled = false;
 
                 match state.versions.pick_compaction() {
@@ -1638,7 +1638,10 @@ impl Db {
             };
 
             // Step 2: Compaction I/O — no lock held.
+            let input_total: usize = comp_state.input_files.iter().map(|f| f.len()).sum();
+            log::info!("compaction: starting merge of {} input files at level {}", input_total, comp_state.level);
             let oldest_snap = self.snapshots.oldest_sequence();
+            let compact_start = std::time::Instant::now();
             let edit = compaction::compact(
                 &self.dbname,
                 &mut comp_state,
@@ -1647,6 +1650,7 @@ impl Db {
                 oldest_snap,
             )?;
 
+            log::info!("compaction: merge complete in {:?}, {} output files", compact_start.elapsed(), comp_state.output_files.len());
             Statistics::record(&self.stats.compactions, 1);
 
             // Throttle compaction I/O via rate limiter if configured.
@@ -1658,8 +1662,10 @@ impl Db {
             }
 
             // Step 3: Apply the edit under lock.
+            log::info!("compaction: acquiring write lock for apply");
             let apply_result = {
                 let mut state = self.state.write().expect("xdb: lock poisoned");
+                log::info!("compaction: applying edit");
                 while state.versions.manifest_file_number() < next_file {
                     state.versions.new_file_number();
                 }
