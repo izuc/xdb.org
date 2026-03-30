@@ -1465,18 +1465,15 @@ impl Db {
             match work {
                 CompactWork::Shutdown => break,
                 CompactWork::MaybeCompact => {
-                    // Compaction is deferred — let L0 files accumulate.
-                    // Reads still work (L0 is searched). This prevents
-                    // the compaction thread from consuming 100% CPU which
-                    // was freezing consensus at round ~17.
-                    // TODO: investigate why compact() runs indefinitely on
-                    // small (4MB) data sets and re-enable once fixed.
                     if let Some(db) = weak.upgrade() {
-                        if db.shutting_down.load(AtomicOrdering::Acquire) {
-                            break;
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            db.do_background_compaction()
+                        })) {
+                            Ok(Err(e)) => log::error!("compact worker: compaction failed: {}", e),
+                            Err(_) => log::error!("compact worker: compaction panicked"),
+                            _ => {}
                         }
                     }
-                    std::thread::sleep(std::time::Duration::from_secs(5));
                 }
             }
         }
@@ -1691,19 +1688,15 @@ impl Db {
             // Loop to check if more compaction is needed.
         }
 
-        // If there's still work, re-schedule after a full second.
-        // The 1s gap gives reads, writes, and consensus a long window of
-        // uncontested access. L0 files accumulate but reads still work
-        // (L0 is searched in parallel). Compaction catches up during
-        // quieter periods.
-        if !self.shutting_down.load(AtomicOrdering::Acquire) {
-            let state = self.state.read().expect("xdb: lock poisoned");
-            if state.versions.pick_compaction().is_some() {
-                drop(state);
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                let _ = self.compact_sender.send(CompactWork::MaybeCompact);
-            }
-        }
+        // Do NOT self-re-trigger compaction here. Under continuous write
+        // load, new L0 files are flushed while compaction runs. If we
+        // re-trigger on every round, compaction never yields CPU because
+        // pick_compaction() always sees the newly flushed L0 files.
+        //
+        // Instead, let the flush path be the sole compaction trigger:
+        // swap_memtable() sends CompactWork::MaybeCompact when L0 count
+        // exceeds the trigger. This ensures compaction only runs when
+        // genuinely needed (new files accumulated), not in a tight loop.
 
         Ok(())
     }
