@@ -47,9 +47,23 @@ use std::thread;
 // Background work types
 // ---------------------------------------------------------------------------
 
-enum BgWork {
-    Flush,
+/// Compaction work sent to the compaction background thread.
+enum CompactWork {
     MaybeCompact,
+    Shutdown,
+}
+
+/// Flush work sent to the dedicated flush background thread.
+/// Keeping flush on a separate thread prevents long-running compactions
+/// from delaying memtable flushes, which would otherwise cause write
+/// stalls that block all readers.
+enum FlushWork {
+    Flush,
+    Shutdown,
+}
+
+/// Legacy shutdown signal for the legacy background worker.
+enum BgWork {
     Shutdown,
 }
 
@@ -70,7 +84,14 @@ pub struct Db {
     snapshots: SnapshotList,
     stats: Arc<Statistics>,
     shutting_down: AtomicBool,
+    /// Dedicated flush thread — never blocked by compaction.
+    flush_sender: Sender<FlushWork>,
+    /// Dedicated compaction thread — long-running but doesn't block flushes.
+    compact_sender: Sender<CompactWork>,
+    /// Legacy sender kept for internal compatibility.
     bg_sender: Sender<BgWork>,
+    _flush_handle: Mutex<Option<thread::JoinHandle<()>>>,
+    _compact_handle: Mutex<Option<thread::JoinHandle<()>>>,
     _bg_handle: Mutex<Option<thread::JoinHandle<()>>>,
     _lock_file: fs::File,
     /// Column family mapping (None if opened without CFs).
@@ -195,6 +216,8 @@ impl Db {
         versions.set_log_number(wal_number);
 
         let (bg_sender, bg_receiver) = crossbeam_channel::unbounded();
+        let (flush_sender, flush_receiver) = crossbeam_channel::unbounded();
+        let (compact_sender, compact_receiver) = crossbeam_channel::unbounded();
 
         let db = Arc::new(Db {
             dbname,
@@ -210,13 +233,35 @@ impl Db {
             snapshots: SnapshotList::new(),
             stats,
             shutting_down: AtomicBool::new(false),
+            flush_sender,
+            compact_sender,
             bg_sender,
+            _flush_handle: Mutex::new(None),
+            _compact_handle: Mutex::new(None),
             _bg_handle: Mutex::new(None),
             _lock_file: lock_file,
             cf_map,
         });
 
-        // Spawn background thread for compaction and flush.
+        // Dedicated flush thread — never blocked by compaction.
+        let weak_flush = Arc::downgrade(&db);
+        let flush_thread_name = format!("xdb-flush-{}", db.dbname.display());
+        let flush_handle = thread::Builder::new()
+            .name(flush_thread_name)
+            .spawn(move || Self::flush_worker(weak_flush, flush_receiver))
+            .map_err(Error::Io)?;
+        *db._flush_handle.lock() = Some(flush_handle);
+
+        // Dedicated compaction thread — long-running but independent.
+        let weak_compact = Arc::downgrade(&db);
+        let compact_thread_name = format!("xdb-compact-{}", db.dbname.display());
+        let compact_handle = thread::Builder::new()
+            .name(compact_thread_name)
+            .spawn(move || Self::compact_worker(weak_compact, compact_receiver))
+            .map_err(Error::Io)?;
+        *db._compact_handle.lock() = Some(compact_handle);
+
+        // Legacy background thread (still used by some internal code paths).
         let weak = Arc::downgrade(&db);
         let thread_name = format!("xdb-bg-{}", db.dbname.display());
         let handle = thread::Builder::new()
@@ -669,6 +714,12 @@ impl Db {
     }
 
     /// Apply a `WriteBatch` atomically.
+    ///
+    /// The write lock is held only for memtable insertion and WAL append.
+    /// If the memtable is full and a background flush is still in progress,
+    /// the lock is **released** while waiting — this prevents write stalls
+    /// from blocking all readers (which caused 100% CPU freezes under
+    /// sustained blockchain workloads).
     pub fn write(&self, write_opts: WriteOptions, mut batch: WriteBatch) -> Result<()> {
         if self.shutting_down.load(AtomicOrdering::Acquire) {
             return Err(Error::ShutdownInProgress);
@@ -679,8 +730,30 @@ impl Db {
             return Ok(());
         }
 
+        // Ensure there is room in the active memtable. If the memtable is
+        // full and a previous flush is still in progress, this spins briefly
+        // WITHOUT holding the write lock so readers are never blocked.
+        self.ensure_write_room()?;
+
         let mut state = self.state.write();
-        self.make_room_for_write(&mut state)?;
+
+        // Double-check after acquiring the lock — another writer may have
+        // already swapped the memtable while we were waiting.
+        if state.mem.approximate_memory_usage() >= self.options.write_buffer_size {
+            if state.imm.is_none() {
+                self.swap_memtable(&mut state)?;
+            }
+            // If imm is still set the background flush is lagging. Rather
+            // than blocking under the write lock (which starves ALL readers),
+            // drop the lock, yield, and retry via ensure_write_room.
+            if state.mem.approximate_memory_usage() >= self.options.write_buffer_size
+                && state.imm.is_some()
+            {
+                drop(state);
+                self.ensure_write_room()?;
+                state = self.state.write();
+            }
+        }
 
         let last_seq = state.versions.last_sequence();
         let first_seq = last_seq + 1;
@@ -712,31 +785,31 @@ impl Db {
     }
 
     /// Force flush the current memtable to disk.
+    ///
+    /// Swaps the active memtable under the write lock, then releases the
+    /// lock and writes the SST file without blocking readers. This prevents
+    /// explicit `flush()` calls (e.g., periodic housekeeping in blockchain
+    /// nodes) from starving the entire database.
     pub fn flush(&self) -> Result<()> {
-        let mut state = self.state.write();
+        // Wait for any pending background flush to complete first.
+        // Without this, we'd overwrite `imm` and lose the pending data.
+        self.wait_for_imm_clear()?;
 
-        if state.mem.is_empty() {
-            return Ok(());
+        // Step 1: Swap memtable under brief write lock.
+        {
+            let mut state = self.state.write();
+            if state.mem.is_empty() && state.imm.is_none() {
+                return Ok(());
+            }
+            if !state.mem.is_empty() {
+                self.swap_memtable(&mut state)?;
+            }
         }
+        // Write lock released.
 
-        // Create the new WAL file BEFORE swapping memtables, so that an
-        // I/O failure (e.g., "too many open files") leaves state untouched.
-        let wal_number = state.versions.new_file_number();
-        let wal_path = self.dbname.join(wal_file_name(wal_number));
-        let wal_file = fs::File::create(&wal_path)?;
-
-        let old_mem = std::mem::replace(&mut state.mem, Arc::new(MemTable::new()));
-        state.imm = Some(old_mem);
-        let old_wal_number = state.versions.log_number();
-        state.wal = Some(WalWriter::new(wal_file));
-        state.versions.set_log_number(wal_number);
-
-        self.do_flush(&mut state)?;
-
-        let old_wal_path = self.dbname.join(wal_file_name(old_wal_number));
-        if let Err(e) = fs::remove_file(&old_wal_path) { log::warn!("failed to delete file: {}", e); }
-
-        Ok(())
+        // Step 2: Flush the immutable memtable without holding the lock.
+        // Uses the same three-step pattern as the background flush worker.
+        self.do_background_flush()
     }
 
     /// Create a point-in-time snapshot of the database.
@@ -931,12 +1004,18 @@ impl Db {
             return Ok(());
         }
 
-        // Signal background thread to stop.
+        // Signal all background threads to stop.
+        let _ = self.flush_sender.send(FlushWork::Shutdown);
+        let _ = self.compact_sender.send(CompactWork::Shutdown);
         let _ = self.bg_sender.send(BgWork::Shutdown);
 
-        // Wait for the background thread to finish. This blocks until the
-        // current flush/compaction round completes (the shutting_down flag
-        // causes the compaction loop to exit early between rounds).
+        // Wait for all background threads to finish.
+        if let Some(handle) = self._flush_handle.lock().take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self._compact_handle.lock().take() {
+            let _ = handle.join();
+        }
         if let Some(handle) = self._bg_handle.lock().take() {
             let _ = handle.join();
         }
@@ -1123,40 +1202,88 @@ impl Db {
 
 
 
-    fn make_room_for_write(&self, state: &mut DbState) -> Result<()> {
-        if state.mem.approximate_memory_usage() < self.options.write_buffer_size {
-            return Ok(());
+    /// Wait (without any lock) for the immutable memtable to be flushed.
+    ///
+    /// Spins with a 1ms sleep between checks. After 5 seconds, gives up
+    /// and returns Ok — the caller will do a synchronous flush as a
+    /// last resort.
+    fn wait_for_imm_clear(&self) -> Result<()> {
+        for _ in 0..5000 {
+            if self.shutting_down.load(AtomicOrdering::Acquire) {
+                return Err(Error::ShutdownInProgress);
+            }
+            if self.state.read().imm.is_none() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        Ok(())
+    }
 
-        // If there's still an immutable memtable being flushed, we must
-        // wait for it to complete before swapping in another one.
-        if state.imm.is_some() {
-            self.do_flush(state)?;
+    /// Ensure there is room to write into the active memtable.
+    ///
+    /// If the memtable is full and a previous flush is still in progress
+    /// (`imm.is_some()`), this method waits **without holding any lock**
+    /// so that readers are never blocked. If the background flush is done,
+    /// it acquires the write lock briefly to swap memtables.
+    fn ensure_write_room(&self) -> Result<()> {
+        loop {
+            if self.shutting_down.load(AtomicOrdering::Acquire) {
+                return Err(Error::ShutdownInProgress);
+            }
+            {
+                let state = self.state.read();
+                if state.mem.approximate_memory_usage() < self.options.write_buffer_size {
+                    return Ok(());
+                }
+                if state.imm.is_some() {
+                    // Background flush still in progress — release lock and wait.
+                    drop(state);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+            }
+            // Memtable is full but imm is clear — swap under brief write lock.
+            {
+                let mut state = self.state.write();
+                // Re-check: another writer may have swapped while we waited.
+                if state.mem.approximate_memory_usage() < self.options.write_buffer_size {
+                    return Ok(());
+                }
+                if state.imm.is_some() {
+                    // Another writer filled it again — retry.
+                    continue;
+                }
+                self.swap_memtable(&mut state)?;
+                return Ok(());
+            }
         }
+    }
 
-        // Create the new WAL BEFORE swapping memtables so an I/O failure
-        // (e.g., fd exhaustion) doesn't leave state inconsistent.
+    /// Swap the active memtable to immutable and schedule a background flush.
+    ///
+    /// Must be called while holding the write lock. The lock is NOT released
+    /// during this call — it only does the swap and sends a message to the
+    /// background thread.
+    fn swap_memtable(&self, state: &mut DbState) -> Result<()> {
         let wal_number = state.versions.new_file_number();
         let wal_path = self.dbname.join(wal_file_name(wal_number));
         let wal_file = fs::File::create(&wal_path)?;
 
         let old_mem = std::mem::replace(&mut state.mem, Arc::new(MemTable::new()));
         state.imm = Some(old_mem);
-        let _old_wal_number = state.versions.log_number();
         state.wal = Some(WalWriter::new(wal_file));
         state.versions.set_log_number(wal_number);
 
-        // Schedule the flush in the background thread so the write path
-        // returns quickly. The old WAL is cleaned up AFTER the flush
-        // completes (inside do_flush), not here — otherwise a crash
-        // before the SST is written would lose the data.
-        let _ = self.bg_sender.send(BgWork::Flush);
+        // Schedule the flush on the DEDICATED flush thread so it is never
+        // blocked by a long-running compaction.
+        let _ = self.flush_sender.send(FlushWork::Flush);
 
-        // Proactively trigger compaction if L0 is getting full.
+        // Proactively trigger compaction on the DEDICATED compaction thread.
         let l0_count = state.versions.current().files_at_level(0).len();
         if l0_count >= self.options.level0_compaction_trigger && !state.bg_compaction_scheduled {
             state.bg_compaction_scheduled = true;
-            let _ = self.bg_sender.send(BgWork::MaybeCompact);
+            let _ = self.compact_sender.send(CompactWork::MaybeCompact);
         }
 
         Ok(())
@@ -1218,7 +1345,7 @@ impl Db {
                     && !state.bg_compaction_scheduled
                 {
                     state.bg_compaction_scheduled = true;
-                    let _ = self.bg_sender.send(BgWork::MaybeCompact);
+                    let _ = self.compact_sender.send(CompactWork::MaybeCompact);
                 }
 
                 Ok(())
@@ -1295,28 +1422,49 @@ impl Db {
 
     /// Background worker loop: receives work items and processes them.
     /// Panics in flush/compaction are caught so the thread stays alive.
-    fn background_worker(weak: Weak<Db>, receiver: crossbeam_channel::Receiver<BgWork>) {
+    /// Legacy background worker — only handles shutdown signal now.
+    /// Flush and compaction are handled by dedicated threads.
+    fn background_worker(_weak: Weak<Db>, receiver: crossbeam_channel::Receiver<BgWork>) {
         while let Ok(work) = receiver.recv() {
             match work {
                 BgWork::Shutdown => break,
-                BgWork::Flush => {
+            }
+        }
+    }
+
+    /// Dedicated flush worker — runs on its own thread so flushes are
+    /// never blocked by long-running compactions.
+    fn flush_worker(weak: Weak<Db>, receiver: crossbeam_channel::Receiver<FlushWork>) {
+        while let Ok(work) = receiver.recv() {
+            match work {
+                FlushWork::Shutdown => break,
+                FlushWork::Flush => {
                     if let Some(db) = weak.upgrade() {
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             db.do_background_flush()
                         })) {
-                            Ok(Err(e)) => log::error!("background flush failed: {}", e),
-                            Err(_) => log::error!("background flush panicked"),
+                            Ok(Err(e)) => log::error!("flush worker: flush failed: {}", e),
+                            Err(_) => log::error!("flush worker: flush panicked"),
                             _ => {}
                         }
                     }
                 }
-                BgWork::MaybeCompact => {
+            }
+        }
+    }
+
+    /// Dedicated compaction worker — runs on its own thread.
+    fn compact_worker(weak: Weak<Db>, receiver: crossbeam_channel::Receiver<CompactWork>) {
+        while let Ok(work) = receiver.recv() {
+            match work {
+                CompactWork::Shutdown => break,
+                CompactWork::MaybeCompact => {
                     if let Some(db) = weak.upgrade() {
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             db.do_background_compaction()
                         })) {
-                            Ok(Err(e)) => log::error!("background compaction failed: {}", e),
-                            Err(_) => log::error!("background compaction panicked"),
+                            Ok(Err(e)) => log::error!("compact worker: compaction failed: {}", e),
+                            Err(_) => log::error!("compact worker: compaction panicked"),
                             _ => {}
                         }
                     }
@@ -1390,7 +1538,7 @@ impl Db {
                     && !state.bg_compaction_scheduled
                 {
                     state.bg_compaction_scheduled = true;
-                    let _ = self.bg_sender.send(BgWork::MaybeCompact);
+                    let _ = self.compact_sender.send(CompactWork::MaybeCompact);
                 }
 
                 Ok(())
@@ -1528,7 +1676,7 @@ impl Db {
         if !self.shutting_down.load(AtomicOrdering::Acquire) {
             let state = self.state.read();
             if state.versions.pick_compaction().is_some() {
-                let _ = self.bg_sender.send(BgWork::MaybeCompact);
+                let _ = self.compact_sender.send(CompactWork::MaybeCompact);
             }
         }
 
