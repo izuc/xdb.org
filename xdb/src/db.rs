@@ -1575,14 +1575,25 @@ impl Db {
     fn do_background_compaction(&self) -> Result<()> {
         use crate::compaction;
 
-        // Limit iterations to prevent infinite loops on corrupt metadata.
-        const MAX_COMPACTION_ROUNDS: usize = 32;
+        // Limit rounds per batch to prevent compaction from starving readers.
+        // With parking_lot's writer-priority RwLock, each write lock
+        // acquisition (steps 1 and 3) blocks all pending readers. Running
+        // 32 rounds continuously created an effective reader starvation
+        // loop that froze consensus in blockchain workloads.
+        const MAX_COMPACTION_ROUNDS: usize = 4;
 
         for _round in 0..MAX_COMPACTION_ROUNDS {
             // Abort early if the database is shutting down so close()
             // doesn't block waiting for a long-running compaction.
             if self.shutting_down.load(AtomicOrdering::Acquire) {
                 break;
+            }
+
+            // Yield between rounds so readers and the flush thread can
+            // acquire the lock. Without this, back-to-back write lock
+            // acquisitions starve readers on parking_lot's fair RwLock.
+            if _round > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
 
             // Step 1: Pick compaction under lock.
@@ -1672,10 +1683,14 @@ impl Db {
         }
 
         // If we hit the round limit and there's still work, re-schedule
-        // so the background thread picks it up on the next iteration.
+        // after a brief pause. The 50ms gap lets reads and writes flow
+        // freely between compaction batches — critical for preventing
+        // consensus stalls in blockchain workloads.
         if !self.shutting_down.load(AtomicOrdering::Acquire) {
             let state = self.state.read();
             if state.versions.pick_compaction().is_some() {
+                drop(state);
+                std::thread::sleep(std::time::Duration::from_millis(50));
                 let _ = self.compact_sender.send(CompactWork::MaybeCompact);
             }
         }
