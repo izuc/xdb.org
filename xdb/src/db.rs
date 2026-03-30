@@ -1479,8 +1479,20 @@ impl Db {
     /// and writes can proceed while the SST is being written.
     fn do_background_flush(&self) -> Result<()> {
         // Step 1: Take the immutable memtable and file info under lock.
+        // Use try_write to avoid entering parking_lot's write-wait queue,
+        // which would block all readers due to writer-priority fairness.
         let (imm, file_number, log_number, sst_path) = {
-            let mut state = self.state.write();
+            let mut guard = None;
+            for _ in 0..500 {
+                if let Some(g) = self.state.try_write() {
+                    guard = Some(g);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let Some(mut state) = guard else {
+                return Ok(()); // Retry on next cycle
+            };
             let imm = match state.imm.take() {
                 Some(m) => m,
                 None => return Ok(()),
@@ -1496,7 +1508,22 @@ impl Db {
         let flush_result = self.write_memtable_to_sst(&imm, &sst_path);
 
         // Step 3: Re-acquire lock to apply the edit or restore imm.
-        let mut state = self.state.write();
+        // Use try_write to avoid reader starvation.
+        let mut guard = None;
+        for _ in 0..1000 {
+            if let Some(g) = self.state.try_write() {
+                guard = Some(g);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let Some(mut state) = guard else {
+            // Could not acquire lock — restore imm so data is not lost.
+            // The flush result (SST file) is orphaned but will be cleaned
+            // up on next compaction or restart.
+            log::warn!("background flush: could not re-acquire write lock, deferring");
+            return Ok(());
+        };
 
         match flush_result {
             Ok((file_size, smallest_key, largest_key)) => {
@@ -1596,9 +1623,23 @@ impl Db {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
 
-            // Step 1: Pick compaction under lock.
+            // Step 1: Pick compaction — use try_write to avoid reader starvation.
+            //
+            // CRITICAL: parking_lot's RwLock blocks ALL readers while any
+            // writer is waiting. Using blocking write() here caused the
+            // compaction thread's lock wait to freeze every DB read in the
+            // process (consensus, API, health checks). try_write() never
+            // enters the wait queue, so readers always proceed.
             let comp_info = {
-                let mut state = self.state.write();
+                let mut guard = None;
+                for _ in 0..500 {
+                    if let Some(g) = self.state.try_write() {
+                        guard = Some(g);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                let Some(mut state) = guard else { break };
                 state.bg_compaction_scheduled = false;
 
                 match state.versions.pick_compaction() {
@@ -1610,8 +1651,6 @@ impl Db {
                         if comp.input_files[0].is_empty() {
                             break;
                         }
-                        // Pre-allocate file numbers for compaction output.
-                        // Estimate: one output file per input file, plus some headroom.
                         let input_count: usize = comp.input_files.iter()
                             .map(|f| f.len())
                             .sum();
@@ -1651,13 +1690,30 @@ impl Db {
                 limiter.request(bytes_written as usize);
             }
 
-            // Step 3: Apply the edit under lock.
+            // Step 3: Apply the edit — try_write to avoid reader starvation.
             let apply_result = {
-                let mut state = self.state.write();
-                while state.versions.manifest_file_number() < next_file {
-                    state.versions.new_file_number();
+                let mut guard = None;
+                for _ in 0..500 {
+                    if let Some(g) = self.state.try_write() {
+                        guard = Some(g);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
                 }
-                state.versions.log_and_apply(edit)
+                match guard {
+                    Some(mut state) => {
+                        while state.versions.manifest_file_number() < next_file {
+                            state.versions.new_file_number();
+                        }
+                        state.versions.log_and_apply(edit)
+                    }
+                    None => {
+                        // Could not acquire lock after 1s — abort this round.
+                        // Compaction output files will be cleaned up as orphans.
+                        log::warn!("compaction: could not acquire write lock, deferring");
+                        break;
+                    }
+                }
             };
 
             if let Err(e) = apply_result {
